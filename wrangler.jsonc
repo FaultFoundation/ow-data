@@ -1,9 +1,9 @@
 // Standalone Cloudflare Worker (its own repo/deploy), NOT part of the Commons
-// OpenNext bundle. Deploys as `ow-stats-poller` and owns the hourly cron that
-// snapshots Overwatch careers into ow-player-data.
+// OpenNext bundle. Deploys as `ow-data` and owns the hourly cron that snapshots
+// Overwatch careers into the ow-player-data D1.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "ow-stats-poller",
+  "name": "ow-data",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-15",
   "compatibility_flags": ["nodejs_compat"],

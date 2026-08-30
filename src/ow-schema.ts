@@ -21,7 +21,7 @@ import {
 // Two writers, deliberately:
 //   1. The Commons (lib/ow-stats.ts) — takes the snapshot when a member connects
 //      Battle.net and lazily refreshes it when they open the Statistics tab.
-//   2. The ow-stats-poller Worker (a SEPARATE repo, like cen-scraper) — an hourly
+//   2. The ow-data poller Worker (a SEPARATE repo, like cen-scraper) — an hourly
 //      cron that snapshots a chunk of due players so inactive members still
 //      accrue history.
 // This is safe because `ow_snapshots` is append-only (never updated/overwritten —

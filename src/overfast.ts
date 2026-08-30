@@ -8,7 +8,7 @@
 // Deliberately PURE: it takes the base URL as an argument and uses global
 // `fetch` only — no `getCloudflareContext`, no `@/` imports — so it can be
 // imported unchanged by BOTH the Commons (lib/ow-stats.ts) and the standalone
-// ow-stats-poller Worker (a separate repo, which keeps its own copy). Keep the
+// ow-data poller Worker (a separate repo, which keeps its own copy). Keep the
 // two copies in sync.
 //
 // Best-effort throughout, mirroring the provider adapters in lib/schedule.ts:

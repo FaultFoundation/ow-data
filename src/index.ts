@@ -11,7 +11,7 @@ import {
 import { MIN_SNAPSHOT_INTERVAL_MS, extractSnapshotColumns } from "./snapshot";
 
 // ---------------------------------------------------------------------------
-// ow-stats-poller — a standalone Cloudflare Worker (its own repo) that keeps the
+// ow-data — a standalone Cloudflare Worker (its own repo) that keeps the
 // Overwatch player-statistics store (the `ow-player-data` D1, shared with the
 // Commons via the OW binding) filling with a daily career snapshot per player,
 // so members accrue history even when they don't open the Statistics tab.
@@ -114,7 +114,7 @@ async function pollHour(env: Env, hour: number): Promise<PollResult> {
       snapshotted++;
     } catch (error) {
       errors++;
-      console.error("ow-stats-poller: snapshot failed for", player.userId, error);
+      console.error("ow-data: snapshot failed for", player.userId, error);
     }
     await sleep(DELAY_MS);
   }
@@ -146,7 +146,7 @@ export default {
   async scheduled(_event, env: Env): Promise<void> {
     const hour = new Date().getUTCHours();
     const result = await pollHour(env, hour);
-    console.log("ow-stats-poller cron", { hour, ...result });
+    console.log("ow-data cron", { hour, ...result });
   },
 
   // Health check + a secret-gated manual trigger (cron can't be fired on
@@ -154,7 +154,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/" || url.pathname === "/health") {
-      return new Response("ow-stats-poller ok");
+      return new Response("ow-data ok");
     }
     if (url.pathname === "/run" && request.method === "POST") {
       if (!env.OW_POLLER_SECRET) return json({ error: "not configured" }, 503);

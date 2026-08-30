@@ -1,6 +1,7 @@
-# ow-stats-poller
+# ow-data
 
-A tiny standalone Cloudflare Worker that keeps **The Commons'** Overwatch
+A tiny standalone Cloudflare Worker (deploys as **`ow-data`**) that keeps **The
+Commons'** Overwatch
 player-statistics store filling with a **daily career snapshot per player**, so
 members build up history even when they don't open the Statistics tab.
 
