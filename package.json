@@ -1,0 +1,21 @@
+{
+  "name": "ow-stats-poller",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Hourly Cloudflare Worker that snapshots Overwatch player careers into the shared ow-player-data D1.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.45.2"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260828.1",
+    "typescript": "^5",
+    "wrangler": "^4.125.0"
+  }
+}

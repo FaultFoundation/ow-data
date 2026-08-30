@@ -1,0 +1,31 @@
+// Standalone Cloudflare Worker (its own repo/deploy), NOT part of the Commons
+// OpenNext bundle. Deploys as `ow-stats-poller` and owns the hourly cron that
+// snapshots Overwatch careers into ow-player-data.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ow-stats-poller",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-15",
+  "compatibility_flags": ["nodejs_compat"],
+  // Hourly, on the hour (UTC). Each tick handles the poll_chunk == UTC hour.
+  "triggers": {
+    "crons": ["0 * * * *"]
+  },
+  "d1_databases": [
+    {
+      // The SAME database the Commons binds as OW. The Commons owns the schema +
+      // migrations (drizzle-ow/); this Worker only reads/writes rows, so it sets
+      // no migrations_dir.
+      "binding": "OW",
+      "database_name": "ow-player-data",
+      "database_id": "770f85f6-d90c-4d35-852b-8296f672b7f9"
+    }
+  ],
+  "vars": {
+    // Optional OverFast base override; unset uses the public instance.
+    // "OVERFAST_API_URL": "https://overfast-api.tekrop.fr"
+  },
+  "observability": {
+    "enabled": true
+  }
+}
