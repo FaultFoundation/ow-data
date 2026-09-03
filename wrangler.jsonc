@@ -1,6 +1,14 @@
 // Standalone Cloudflare Worker (its own repo/deploy), NOT part of the Commons
 // OpenNext bundle. Deploys as `ow-data` and owns the hourly cron that snapshots
-// Overwatch careers into the ow-player-data D1.
+// Overwatch careers into the ow-player-data D1, plus the cross-provider
+// player-data sync (external FACEIT/start.gg teams + match history, the pd_*
+// tables in the same database).
+//
+// Secrets (wrangler secret put; .dev.vars locally):
+//   OW_POLLER_SECRET — gates the manual POST /run trigger.
+//   FACEIT_API_KEY   — FACEIT Data API key for the pd sync (same value as the
+//                      Commons'); unset leaves FACEIT rows to page-open syncs.
+//   STARTGG_API_KEY  — start.gg personal token, likewise.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "ow-data",
