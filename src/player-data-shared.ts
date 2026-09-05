@@ -1,6 +1,3 @@
-// ⚠️ MIRROR of the Commons `lib/player-data-shared.ts` (the client-safe half of
-// the cross-provider player-data system). Copied verbatim so the sync core can
-// share its types/constants; keep the two in step when either changes.
 // ---------------------------------------------------------------------------
 // Cross-provider player data (external teams + match history) — the client-safe
 // half. Provider ids, labels, the row shapes the UI renders, and the cache/TTL
@@ -75,6 +72,8 @@ export type ExternalTeamMember = {
 
 /** One match row (Match Data tab and the team detail's match list). */
 export type ExternalMatchRow = {
+  matchKey?: string;
+  reportedTime?: { revision: number; scheduledAt: number; sourceUrl: string; conflictsWithProvider: boolean };
   id: string;
   provider: PdProvider;
   game: string | null;

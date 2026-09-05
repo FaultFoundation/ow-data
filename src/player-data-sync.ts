@@ -1,6 +1,3 @@
-// ⚠️ MIRROR of the Commons `lib/player-data-sync.ts` — the PURE sync core for
-// external teams + match history. Only the two import paths below differ from
-// the Commons copy; keep the rest in step when either changes.
 import { and, eq, inArray } from "drizzle-orm";
 
 import {
@@ -241,12 +238,13 @@ function faceitMatchStatus(
 ): MatchUpsert["status"] {
   switch ((status ?? "").toUpperCase()) {
     case "ONGOING":
-    case "READY":
       return "live";
     case "CANCELLED":
       return "cancelled";
-    default:
+    case "FINISHED":
       return "finished";
+    default:
+      return "scheduled";
   }
 }
 
@@ -408,10 +406,9 @@ async function syncFaceit(
         FACEIT_PAGE_SIZE,
       );
       if (items === null) {
-        // Deep-offset rejection or transient failure: move on to the next game
-        // rather than wedging the cursor on one page forever.
-        cursor = { ...cursor, gi: cursor.gi + 1, offset: 0 };
-        continue;
+        // A failed page is not an exhausted history. Preserve the saved cursor
+        // so a transient error cannot permanently discard this game's matches.
+        return err("FACEIT history could not be loaded. The import will retry.");
       }
       for (const m of items) {
         const parsed = parseFaceitMatch(m, playerId, game);
@@ -433,7 +430,8 @@ async function syncFaceit(
         0,
         FACEIT_INCREMENTAL_LIMIT,
       );
-      for (const m of items ?? []) {
+      if (items === null) return err("FACEIT history could not be refreshed. The sync will retry.");
+      for (const m of items) {
         const parsed = parseFaceitMatch(m, playerId, game);
         if (parsed) matches.push(parsed);
       }
@@ -697,11 +695,12 @@ async function syncStartgg(
   let page = Math.max(1, asNumber(stored.page) ?? 1);
   let backfillDone = row.backfillDone;
   let pulledAnything = false;
+  let historyFailed = false;
 
   if (!backfillDone) {
     for (let calls = 0; calls < STARTGG_BACKFILL_PAGES; calls++) {
       const res = await startggSetsPage(apiKey, playerId, page);
-      if (!res) break; // resume from this page next tick
+      if (!res) { historyFailed = true; break; } // preserve cursor and retry
       pulledAnything = true;
       for (const node of res.nodes) {
         const parsed = parseStartggSet(node, playerId);
@@ -715,6 +714,7 @@ async function syncStartgg(
     }
   } else {
     const res = await startggSetsPage(apiKey, playerId, 1);
+    if (!res) historyFailed = true;
     if (res) {
       pulledAnything = true;
       for (const node of res.nodes) {
@@ -733,8 +733,8 @@ async function syncStartgg(
     matches,
     cursor: JSON.stringify({ page } satisfies StartggCursor),
     backfillDone,
-    status: "ok",
-    statusDetail: null,
+    status: historyFailed ? "error" : "ok",
+    statusDetail: historyFailed ? "start.gg match history could not be loaded. The import will retry." : null,
     metaPatch: { startggPlayerId: playerId },
   };
 }
@@ -746,6 +746,7 @@ async function syncStartgg(
 
 type ChallongeCursor = {
   page: number;
+  activeOffset?: number;
   /** tournament id → state at last ingestion; completed tournaments never
       change, so this is what makes incremental re-lists cheap. Bounded by the
       member's own tournament count. */
@@ -774,6 +775,8 @@ function challongeMatchStatus(state: unknown): MatchUpsert["status"] {
 /** "3-1,2-3,3-0" → summed sets won per side, best-effort. */
 function parseScoresCsv(csv: string | null): [number, number] | null {
   if (!csv) return null;
+  const single = /^\s*(\d+)\s*-\s*(\d+)\s*$/.exec(csv);
+  if (single) return [Number(single[1]), Number(single[2])];
   let a = 0;
   let b = 0;
   let any = false;
@@ -931,14 +934,15 @@ async function syncChallonge(
 
   // Ingest tournaments that are new or whose state moved, a bounded number per
   // tick (each costs a participants + a matches call).
-  const due = list
-    .filter((t) => cursor.seen[t.id] !== t.state)
-    .slice(0, CHALLONGE_TOURNAMENTS_PER_TICK);
+  const eligible = list.filter(t => cursor.seen[t.id] !== t.state || (backfillDone && !["complete", "completed", "cancelled"].includes(t.state)));
+  const offset = backfillDone && eligible.length ? Math.max(0, asNumber(stored.activeOffset) ?? 0) % eligible.length : 0;
+  const due = [...eligible.slice(offset), ...eligible.slice(0, offset)].slice(0, CHALLONGE_TOURNAMENTS_PER_TICK);
+  let historyFailed = false;
   const matches: MatchUpsert[] = [];
   const seen = { ...cursor.seen };
   for (const t of due) {
     const pulled = await challongeTournamentMatches(token, t, row.handle);
-    if (pulled === null) continue; // retry next tick
+    if (pulled === null) { historyFailed = true; continue; } // retry next tick
     matches.push(...pulled);
     seen[t.id] = t.state;
   }
@@ -956,10 +960,10 @@ async function syncChallonge(
   return {
     teams: null, // Challonge contributes matches only
     matches,
-    cursor: JSON.stringify({ page, seen } satisfies ChallongeCursor),
+    cursor: JSON.stringify({ page, seen, activeOffset: offset + due.length } satisfies ChallongeCursor),
     backfillDone,
-    status: "ok",
-    statusDetail: null,
+    status: historyFailed ? "error" : "ok",
+    statusDetail: historyFailed ? "Some Challonge results could not be loaded. The sync will retry." : null,
     metaPatch: null,
   };
 }
