@@ -21,12 +21,18 @@
   },
   "d1_databases": [
     {
-      // The SAME database the Commons binds as OW. The Commons owns the schema +
-      // migrations (drizzle-ow/); this Worker only reads/writes rows, so it sets
-      // no migrations_dir.
+      // The SAME database the Commons binds as OW. The Commons owns the ow_* and
+      // pd_* schema + migrations (drizzle-ow/); this Worker owns ONLY the
+      // faceit_* tables (the FACEIT match search cache) and migrates them from
+      // `drizzle-faceit/`. The two owners never collide because their applied-
+      // migration tracking lives in SEPARATE tables (migrations_table below vs.
+      // the Commons' default) and their table sets are disjoint. For ow_*/pd_*
+      // this Worker still only reads/writes rows.
       "binding": "OW",
       "database_name": "ow-player-data",
-      "database_id": "770f85f6-d90c-4d35-852b-8296f672b7f9"
+      "database_id": "770f85f6-d90c-4d35-852b-8296f672b7f9",
+      "migrations_dir": "drizzle-faceit",
+      "migrations_table": "d1_migrations_faceit"
     }
   ],
   "vars": {

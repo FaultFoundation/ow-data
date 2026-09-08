@@ -1,8 +1,13 @@
 import { drizzle } from "drizzle-orm/d1";
-import { isNull, lt, or } from "drizzle-orm";
+import { and, desc, isNotNull, isNull, lt, or } from "drizzle-orm";
 import { eq } from "drizzle-orm";
 
 import { owPlayers, owSnapshots, pdSync } from "./ow-schema";
+import {
+  faceitMatchPlayers,
+  faceitMatches,
+  faceitPlayers,
+} from "./faceit-schema";
 import {
   DEFAULT_OVERFAST_BASE,
   fetchOwStatsSummary,
@@ -15,6 +20,13 @@ import {
   runProviderSync,
   staleRosterTeamIds,
 } from "./player-data-sync";
+import {
+  collectDetailChunk,
+  collectListChunk,
+  finalizePlayerState,
+  resolveFaceitPlayer,
+  upsertProfileStmt,
+} from "./faceit-collect";
 
 // ---------------------------------------------------------------------------
 // ow-data — a standalone Cloudflare Worker (its own repo) that keeps the
@@ -204,6 +216,286 @@ async function pollPlayerDataHour(env: Env, hour: number): Promise<PdPollResult>
   return { processed: due.length, synced, errors };
 }
 
+// ---------------------------------------------------------------------------
+// FACEIT match-search collection (faceit_* tables). A SEARCH-driven cache: the
+// Commons search box triggers POST /faceit/search on this Worker, which resolves
+// the player and advances a bounded, resumable two-phase collection (match LIST,
+// then per-match overview + scoreboard DETAIL). The hourly cron finishes any
+// backfill still in flight; the Commons reads the faceit_* rows directly.
+//
+// "quick" surfaces the list fast and fills detail lazily; "deep" front-loads the
+// detail with bigger budgets. Same engine (faceit-collect.ts), different budgets.
+// ---------------------------------------------------------------------------
+
+type FaceitBudget = { listPages: number; detailMatches: number };
+
+// The trigger returns fast: one list page synchronously, the rest in waitUntil.
+const FACEIT_TRIGGER_SYNC: FaceitBudget = { listPages: 1, detailMatches: 0 };
+const FACEIT_WAITUNTIL: Record<"quick" | "deep", FaceitBudget> = {
+  quick: { listPages: 3, detailMatches: 8 },
+  deep: { listPages: 8, detailMatches: 30 },
+};
+// Cron chips away at anything still unfinished, bounded so one tick stays under
+// the subrequest cap even across several due players.
+const FACEIT_CRON: Record<"quick" | "deep", FaceitBudget> = {
+  quick: { listPages: 3, detailMatches: 12 },
+  deep: { listPages: 4, detailMatches: 20 },
+};
+const FACEIT_CRON_MAX_PLAYERS = 8;
+
+type FaceitDbHandle = ReturnType<typeof faceitDb>;
+function faceitDb(env: Env) {
+  return drizzle(env.OW, {
+    schema: { faceitPlayers, faceitMatches, faceitMatchPlayers },
+  });
+}
+
+type FaceitPlayerRow = {
+  playerId: string;
+  game: string;
+  listOffset: number;
+  listDone: boolean;
+  detailDone: boolean;
+  searchMode: string | null;
+};
+
+/**
+ * Advance one searched player by a bounded amount: page the match LIST (until
+ * done), then fill per-match DETAIL, then persist the recomputed state. Never
+ * throws — a provider miss lands as status 'error' with the cursor intact.
+ */
+async function advanceFaceitPlayer(
+  db: FaceitDbHandle,
+  apiKey: string,
+  row: FaceitPlayerRow,
+  budget: FaceitBudget,
+): Promise<{ matchCount: number; listDone: boolean; detailDone: boolean }> {
+  let listOffset = row.listOffset;
+  let listDone = row.listDone;
+  let failed = false;
+
+  if (!listDone && budget.listPages > 0) {
+    const r = await collectListChunk(
+      db,
+      apiKey,
+      { playerId: row.playerId, game: row.game, listOffset },
+      budget.listPages,
+    );
+    listOffset = r.newOffset;
+    listDone = r.listDone;
+    if (r.failed) failed = true;
+  }
+
+  if (budget.detailMatches > 0) {
+    const d = await collectDetailChunk(db, apiKey, row.playerId, budget.detailMatches);
+    if (d.failed > 0) failed = true;
+  }
+
+  const state = await finalizePlayerState(db, row.playerId, {
+    listOffset,
+    listDone,
+    failed,
+  });
+  return state;
+}
+
+/** Sweep due searched players (this hour's bucket + stale catch-ups) that still
+    have backfill left, advancing each by a bounded cron budget. */
+async function faceitSweep(
+  env: Env,
+  hour: number,
+): Promise<{ processed: number; errors: number }> {
+  if (!env.FACEIT_API_KEY) return { processed: 0, errors: 0 };
+  const db = faceitDb(env);
+  const staleCutoff = new Date(Date.now() - DAY_MS);
+
+  // SQL-filter to SEARCHED, UNFINISHED players only — the table also holds every
+  // opponent seeded during collection, so a full scan would grow without bound.
+  const candidates = await db
+    .select()
+    .from(faceitPlayers)
+    .where(
+      and(
+        isNotNull(faceitPlayers.searchMode),
+        isNotNull(faceitPlayers.pollChunk),
+        or(eq(faceitPlayers.listDone, false), eq(faceitPlayers.detailDone, false)),
+      ),
+    );
+  const due = candidates
+    .filter(
+      (p) =>
+        p.pollChunk === hour ||
+        p.lastSyncedAt == null ||
+        p.lastSyncedAt < staleCutoff,
+    )
+    // Deep collections first — they asked for the whole history up front.
+    .sort((a, b) => (a.searchMode === "deep" ? -1 : 1) - (b.searchMode === "deep" ? -1 : 1))
+    .slice(0, FACEIT_CRON_MAX_PLAYERS);
+
+  let errors = 0;
+  for (const p of due) {
+    const mode = p.searchMode === "deep" ? "deep" : "quick";
+    try {
+      await advanceFaceitPlayer(
+        db,
+        env.FACEIT_API_KEY,
+        {
+          playerId: p.playerId,
+          game: p.game,
+          listOffset: p.listOffset,
+          listDone: p.listDone,
+          detailDone: p.detailDone,
+          searchMode: p.searchMode,
+        },
+        FACEIT_CRON[mode],
+      );
+    } catch (error) {
+      errors++;
+      console.error("ow-data: faceit sweep failed for", p.playerId, error);
+    }
+    await sleep(DELAY_MS);
+  }
+  return { processed: due.length, errors };
+}
+
+/**
+ * Handle POST /faceit/search — resolve a nickname/guid, register it for the
+ * requested mode, do one list page synchronously so the cache has immediate
+ * data, and continue the rest in waitUntil. The Commons reads faceit_* directly.
+ */
+async function handleFaceitSearch(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  url: URL,
+): Promise<Response> {
+  if (!env.FACEIT_API_KEY) return json({ error: "FACEIT not configured" }, 503);
+  const nickname = url.searchParams.get("nickname") ?? undefined;
+  const playerId = url.searchParams.get("player_id") ?? undefined;
+  const mode = url.searchParams.get("mode") === "deep" ? "deep" : "quick";
+  if (!nickname && !playerId) {
+    return json({ error: "nickname or player_id required" }, 400);
+  }
+
+  const db = faceitDb(env);
+  const resolved = await resolveFaceitPlayer(env.FACEIT_API_KEY, { nickname, playerId });
+  if (resolved === "not_found") {
+    if (playerId) {
+      await db
+        .update(faceitPlayers)
+        .set({ status: "not_found", updatedAt: new Date() })
+        .where(eq(faceitPlayers.playerId, playerId));
+    }
+    return json({ error: "player not found" }, 404);
+  }
+  if (!resolved) return json({ error: "FACEIT unreachable" }, 502);
+
+  // Register the search (sets mode + poll bucket + status 'collecting').
+  const now = new Date();
+  const [existing] = await db
+    .select({ listOffset: faceitPlayers.listOffset, listDone: faceitPlayers.listDone })
+    .from(faceitPlayers)
+    .where(eq(faceitPlayers.playerId, resolved.playerId));
+  await db.batch([upsertProfileStmt(db, resolved, { mode, now })]);
+
+  // Immediate: one list page so the first screen has matches right away.
+  const state = await advanceFaceitPlayer(
+    db,
+    env.FACEIT_API_KEY,
+    {
+      playerId: resolved.playerId,
+      game: resolved.game,
+      listOffset: existing?.listOffset ?? 0,
+      listDone: existing?.listDone ?? false,
+      detailDone: false,
+      searchMode: mode,
+    },
+    FACEIT_TRIGGER_SYNC,
+  );
+
+  // Background: continue list + fill detail without holding the response.
+  ctx.waitUntil(
+    (async () => {
+      try {
+        const [fresh] = await db
+          .select({
+            listOffset: faceitPlayers.listOffset,
+            listDone: faceitPlayers.listDone,
+            detailDone: faceitPlayers.detailDone,
+          })
+          .from(faceitPlayers)
+          .where(eq(faceitPlayers.playerId, resolved.playerId));
+        await advanceFaceitPlayer(
+          db,
+          env.FACEIT_API_KEY as string,
+          {
+            playerId: resolved.playerId,
+            game: resolved.game,
+            listOffset: fresh?.listOffset ?? state.matchCount,
+            listDone: fresh?.listDone ?? state.listDone,
+            detailDone: fresh?.detailDone ?? state.detailDone,
+            searchMode: mode,
+          },
+          FACEIT_WAITUNTIL[mode],
+        );
+      } catch (error) {
+        console.error("ow-data: faceit waitUntil failed for", resolved.playerId, error);
+      }
+    })(),
+  );
+
+  return json({
+    player: {
+      playerId: resolved.playerId,
+      nickname: resolved.nickname,
+      avatarUrl: resolved.avatarUrl,
+      skillLevel: resolved.skillLevel,
+      faceitElo: resolved.faceitElo,
+      region: resolved.region,
+      faceitUrl: resolved.faceitUrl,
+    },
+    mode,
+    status: state.listDone && state.detailDone ? "ready" : "collecting",
+    matchCount: state.matchCount,
+    listDone: state.listDone,
+    detailDone: state.detailDone,
+  });
+}
+
+/** Read the cached collection for a player (identity + matches + scoreboard). */
+async function handleFaceitRead(env: Env, url: URL): Promise<Response> {
+  const playerId = url.searchParams.get("player_id") ?? undefined;
+  const nickname = url.searchParams.get("nickname") ?? undefined;
+  const limit = Math.min(Number(url.searchParams.get("limit") ?? 50) || 50, 200);
+  if (!playerId && !nickname) return json({ error: "nickname or player_id required" }, 400);
+
+  const db = faceitDb(env);
+  const [player] = await db
+    .select()
+    .from(faceitPlayers)
+    .where(
+      playerId
+        ? eq(faceitPlayers.playerId, playerId)
+        : eq(faceitPlayers.nickname, nickname as string),
+    );
+  if (!player) return json({ error: "not collected yet" }, 404);
+
+  const rows = await db
+    .select()
+    .from(faceitMatchPlayers)
+    .innerJoin(faceitMatches, eq(faceitMatchPlayers.matchId, faceitMatches.matchId))
+    .where(eq(faceitMatchPlayers.playerId, player.playerId))
+    .orderBy(desc(faceitMatches.startedAt))
+    .limit(limit);
+
+  return json({
+    player,
+    matchCount: player.matchCount,
+    status: player.status,
+    matches: rows.map((r) => ({ ...r.faceit_matches, me: r.faceit_match_players })),
+  });
+}
+
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -232,15 +524,35 @@ export default {
     console.log("ow-data cron", { hour, ...result });
     const pd = await pollPlayerDataHour(env, hour);
     console.log("ow-data pd cron", { hour, ...pd });
+    const faceit = await faceitSweep(env, hour);
+    console.log("ow-data faceit cron", { hour, ...faceit });
   },
 
   // Health check + a secret-gated manual trigger (cron can't be fired on
   // demand, so this is how the run logic is exercised in dev / on rollout).
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/" || url.pathname === "/health") {
       return new Response("ow-data ok");
     }
+
+    // FACEIT match search — gated by the same bearer as /run (the Commons calls
+    // it server-to-server). POST triggers a collection; GET reads the cache.
+    if (url.pathname === "/faceit/search" && request.method === "POST") {
+      if (!env.OW_POLLER_SECRET) return json({ error: "not configured" }, 503);
+      if (!bearerOk(request.headers.get("authorization"), env.OW_POLLER_SECRET)) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      return handleFaceitSearch(request, env, ctx, url);
+    }
+    if (url.pathname === "/faceit/player" && request.method === "GET") {
+      if (!env.OW_POLLER_SECRET) return json({ error: "not configured" }, 503);
+      if (!bearerOk(request.headers.get("authorization"), env.OW_POLLER_SECRET)) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      return handleFaceitRead(env, url);
+    }
+
     if (url.pathname === "/run" && request.method === "POST") {
       if (!env.OW_POLLER_SECRET) return json({ error: "not configured" }, 503);
       if (!bearerOk(request.headers.get("authorization"), env.OW_POLLER_SECRET)) {
