@@ -52,9 +52,31 @@ same `FACEIT_API_KEY` the `pd_*` sync uses) — no scraping. Three calls per mat
 
 - `GET /players/{id}/history?game=ow2` — the match **list** (paged 100/call).
 - `GET /matches/{id}` — **overview**: server (`voting.location.pick` → name),
-  map (`voting.map.pick`), hero **bans** (votable pool − `voting.heroes.pick`),
-  replay codes (`demo_url`), round / group / best-of.
-- `GET /matches/{id}/stats` — the **scoreboard** (per-player stats + team stats).
+  the map **pool** (`voting.map.entities`, which is also the only place a map
+  guid is given a name), hero **bans** (votable pool − `voting.heroes.pick`),
+  replay codes (`demo_url`), round / group / best-of, and the **series result**.
+- `GET /matches/{id}/stats` — the **scoreboard** (per-player stats + team stats)
+  and `rounds[]`, one per **map actually played** → `faceit_match_rounds`.
+
+### Two Overwatch shapes worth knowing before touching this
+
+Both of these made the collected data disagree with a player's own FACEIT
+profile, and both are easy to reintroduce:
+
+- **A match is a Bo3/Bo5 series, so its map is a per-ROUND fact.**
+  `voting.map.pick` is an array of up to five maps (the planned pool) and
+  `faceit_matches.map_*` keeps only its first entry — which in the OW
+  competitive format is nearly always the Control map. Map statistics therefore
+  read `faceit_match_rounds`, one row per map played, whose `winner_team_id`
+  joins to `faceit_match_players.team_id`. Note that rounds ≤ picks: a Bo5 that
+  ends 3–0 vetoes five maps and plays three, so the rounds — never the picks —
+  are what a map aggregate counts. `round_stats` also carries `OW2 Mode`
+  directly, so rounds don't inherit the veto's occasional missing mode tags.
+- **The history listing's `results` is the FIRST MAP, not the series.** A match
+  won 3–2 is listed as `winner: <the map-1 winner>, score 1–2`. The LIST phase
+  can only write what it is given, so DETAIL re-derives every participant's
+  `result` from `/matches/{id}` (the endpoint that reports the series) and
+  overwrites it. Roughly one match in eight flips.
 
 Collection is two-phase and resumable, so a deep history never hits the paid
 plan's per-request subrequest cap:
@@ -62,7 +84,15 @@ plan's per-request subrequest cap:
 - **LIST** pages the history, upserting a `faceit_matches` summary + one
   `faceit_match_players` row per participant, and seeds every seen player into
   `faceit_players` (so searching an opponent later is instant).
-- **DETAIL** fills each match's overview + scoreboard, newest-first.
+- **DETAIL** fills each match's overview, scoreboard and per-map rounds,
+  newest-first, and repairs the series `result` while it is there.
+
+`faceit_matches` carries three independent completion markers —
+`detail_synced_at`, `stats_synced_at`, `rounds_synced_at` — and a match is
+"due" while any is null. `rounds_synced_at` is separate precisely so matches
+collected before rounds existed (whose other two markers are already set) get
+picked up once by the ordinary sweep; a match needing only rounds still fetches
+the overview, because the map names live in its veto entities.
 
 `POST /faceit/search?nickname=…&mode=quick|deep` (bearer = `OW_POLLER_SECRET`)
 resolves the player, does one list page synchronously, and continues in the
@@ -77,6 +107,9 @@ counts (`status`, `matchCount`, `undetailed`, `listDone`, `detailDone`). The
 Commons deep search loops this behind a load screen until the whole history is in
 or a client safety cap is hit. Icons (hero / map / server) are deliberately **not**
 stored — only player avatars.
+
+Pure parsers are unit-tested against these shapes — `npm test` (node:test; the
+production TS is transpiled in-process, since this Worker has no build step).
 
 ```sh
 curl -X POST -H "authorization: Bearer $OW_POLLER_SECRET" \
@@ -103,6 +136,12 @@ npm run db:faceit:generate           # drizzle-kit → drizzle-faceit/NNNN_*.sql
 npm run db:faceit:migrate:local      # apply to the local D1 (wrangler)
 npm run db:faceit:migrate:remote     # apply to the shared remote D1
 ```
+
+A migration may also carry a **data** statement when a schema change makes a
+stored flag untrue — `0001_faceit_match_rounds.sql` clears `detail_done` on every
+searched player, because the sweep selects on that flag and no player is really
+detail-complete once per-map rounds exist. Without it the backfill would only
+reach players somebody happened to search again.
 
 > ⚠️ **Never** `drizzle-kit push` here — it diffs the *whole* DB and would drop
 > the Commons' tables. Only `generate` + `migrate`. The **Commons** keeps a

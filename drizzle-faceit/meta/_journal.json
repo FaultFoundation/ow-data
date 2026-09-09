@@ -8,6 +8,13 @@
       "when": 1788843565610,
       "tag": "0000_faceit_search_init",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1788930443033,
+      "tag": "0001_faceit_match_rounds",
+      "breakpoints": true
     }
   ]
 }

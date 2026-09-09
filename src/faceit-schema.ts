@@ -30,7 +30,10 @@ import {
 //                                  summary cols + faceit_match_players list rows
 //   GET /matches/{id}           — OVERVIEW: server, map, hero bans, replay codes
 //   GET /matches/{id}/stats     — SCOREBOARD: per-player elims/deaths/assists/
-//                                  K-D/damage/healing/mitigation/role/result
+//                                  K-D/damage/healing/mitigation/role, AND the
+//                                  per-map round rows (faceit_match_rounds) —
+//                                  an OW match is a Bo3/Bo5 series, so the map
+//                                  a player played is a round, not a match.
 //
 // "Quick" search stores the list immediately and fills detail in the background
 // (cron + waitUntil); "deep" front-loads the detail. Both drive the SAME engine
@@ -161,6 +164,13 @@ export const faceitMatches = sqliteTable(
     detailSyncedAt: integer("detail_synced_at", { mode: "timestamp_ms" }),
     /** When `/matches/{id}/stats` scoreboard was parsed (null = not yet). */
     statsSyncedAt: integer("stats_synced_at", { mode: "timestamp_ms" }),
+    /** When the per-map `faceit_match_rounds` rows were written (null = not
+     *  yet). Deliberately SEPARATE from stats_synced_at even though both come
+     *  from the same `/matches/{id}/stats` call: every match collected before
+     *  rounds existed has stats_synced_at set, so a shared marker would have
+     *  left them permanently un-backfilled. This one starts null everywhere and
+     *  drives the existing detail sweep through them once. */
+    roundsSyncedAt: integer("rounds_synced_at", { mode: "timestamp_ms" }),
     createdAt: integer("created_at", { mode: "timestamp_ms" })
       .notNull()
       .$defaultFn(() => new Date()),
@@ -173,7 +183,61 @@ export const faceitMatches = sqliteTable(
     index("faceit_matches_started_idx").on(t.startedAt),
     index("faceit_matches_detail_synced_idx").on(t.detailSyncedAt),
     index("faceit_matches_stats_synced_idx").on(t.statsSyncedAt),
+    index("faceit_matches_rounds_synced_idx").on(t.roundsSyncedAt),
     index("faceit_matches_competition_idx").on(t.competitionId),
+  ],
+);
+
+/**
+ * One row per MAP played inside a match — the unit FACEIT's own profile counts.
+ *
+ * This exists because an Overwatch FACEIT "match" is a Bo3/Bo5 SERIES, not a
+ * single map: `voting.map.pick` holds up to five maps and the series plays as
+ * many as it needs. faceit_matches.map_* only ever held the FIRST pick, which
+ * is why every win-rate-by-map read was dominated by Control (map 1 in the OW
+ * competitive format) and missed the rest of the series entirely.
+ *
+ * The authoritative per-map record is `rounds[].round_stats` on
+ * `/matches/{id}/stats`: `Map` (a hex map guid), `Winner` (a team/faction id
+ * that matches faceit_match_players.team_id) and `OW2 Mode`. Note that ROUNDS
+ * are the maps actually PLAYED while `pick` is only the planned pool — a Bo5
+ * that ends 3–0 has five picks and three rounds — so these rows, never the
+ * picks, are what a map aggregate counts.
+ *
+ * The map NAME is not in round_stats (only the guid), so it is resolved against
+ * the same match's `voting.map.entities`; a guid with no entity keeps the id and
+ * a null name rather than inventing one.
+ */
+export const faceitMatchRounds = sqliteTable(
+  "faceit_match_rounds",
+  {
+    /** Deterministic `${matchId}:${roundIndex}`. */
+    id: text("id").primaryKey(),
+    matchId: text("match_id").notNull(),
+    /** 1-based position in the series (the order the maps were played). */
+    roundIndex: integer("round_index").notNull(),
+    /** OW map guid ("0x0800000000000CF2") + its resolved name and mode. */
+    mapId: text("map_id"),
+    mapName: text("map_name"),
+    mapMode: text("map_mode"),
+    /** The team/faction id that WON this map — joins to
+     *  faceit_match_players.team_id, which is how a per-player map record is
+     *  derived without a row per participant per map. Null = undecided. */
+    winnerTeamId: text("winner_team_id"),
+    /** The map's own scoreline as FACEIT words it ("2 / 1"). */
+    scoreSummary: text("score_summary"),
+    createdAt: integer("created_at", { mode: "timestamp_ms" })
+      .notNull()
+      .$defaultFn(() => new Date()),
+    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+      .notNull()
+      .$defaultFn(() => new Date()),
+  },
+  (t) => [
+    // "this match's maps, in order" (the scoreboard's round tabs).
+    index("faceit_match_rounds_match_idx").on(t.matchId),
+    // "group this player's maps by name" (the win-rate-by-map aggregate).
+    index("faceit_match_rounds_map_idx").on(t.mapName),
   ],
 );
 

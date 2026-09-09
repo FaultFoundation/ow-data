@@ -3,6 +3,7 @@ import type { DrizzleD1Database } from "drizzle-orm/d1";
 
 import {
   faceitMatchPlayers,
+  faceitMatchRounds,
   faceitMatches,
   faceitPlayers,
 } from "./faceit-schema";
@@ -20,11 +21,23 @@ import {
 //            player into faceit_players so a later search for an opponent is
 //            instant. Advances faceit_players.list_offset; sets list_done on a
 //            short page.
-//   DETAIL — for this player's matches still missing overview/scoreboard, fetch
-//            GET /matches/{id} (server / map / hero bans / replay codes) and
-//            GET /matches/{id}/stats (per-player elims/deaths/assists/K-D/
-//            damage/healing/mitigation/role). Newest-first, so "quick" surfaces
-//            recent detail fast and "deep" simply runs more chunks per tick.
+//   DETAIL — for this player's matches still missing overview/scoreboard/rounds,
+//            fetch GET /matches/{id} (server / map pool / hero bans / replay
+//            codes / the TRUE series winner) and GET /matches/{id}/stats
+//            (per-player elims/deaths/assists/K-D/damage/healing/mitigation/
+//            role, plus one faceit_match_rounds row per map actually played).
+//            Newest-first, so "quick" surfaces recent detail fast and "deep"
+//            simply runs more chunks per tick.
+//
+// Two Overwatch-specific traps this phase exists to close, both of which made
+// the collected data disagree with the player's own FACEIT profile:
+//   * A match is a Bo3/Bo5 SERIES. Its map is a per-ROUND fact, so map stats
+//     come from faceit_match_rounds, never from faceit_matches.map_name (which
+//     is only the first pick of the veto).
+//   * The history listing's `results` describes the FIRST MAP, not the series:
+//     a match won 3–2 is listed as `winner: <the map-1 winner>, score 1–2`. The
+//     list phase can only write that, so DETAIL re-derives every participant's
+//     `result` from `/matches/{id}` — the endpoint that reports the series.
 //
 // Pure parsers (parse*) are separated from the D1 writers (collect*/upsert*) so
 // the shapes stay testable. Never throws out of a collect* call — a transient
@@ -631,7 +644,13 @@ export type ParsedDetail = {
     membership: string | null;
     gameSkillLevel: number | null;
     gamePlayerName: string | null;
+    /** The SERIES result, re-derived here because the history listing reports
+     *  only the first map's winner (see the phase notes at the top). */
+    result: "win" | "loss" | "draw" | null;
   }>;
+  /** Every votable map in this match, guid → name + mode. `round_stats.Map` is
+   *  a bare guid, so this is what turns a round into a named map. */
+  mapNames: Record<string, { name: string | null; mode: string | null }>;
 };
 
 export function parseMatchDetail(body: unknown): ParsedDetail | null {
@@ -645,7 +664,19 @@ export function parseMatchDetail(body: unknown): ParsedDetail | null {
     (e) => e.guid === locPick || e.game_location_id === locPick,
   );
 
-  // Map: pick → name + mode.
+  // Map: the veto's entity list is the only place a map guid is given a NAME, so
+  // keep the whole lookup for the round rows. `pick` is the planned pool (up to
+  // five for a Bo5) and map_* below keeps its first entry for backwards
+  // compatibility only — the maps actually played come from round_stats.
+  const mapNames: ParsedDetail["mapNames"] = {};
+  for (const e of v.map?.entities ?? []) {
+    const id = e.guid ?? e.game_map_id;
+    if (!id) continue;
+    mapNames[id] = {
+      name: asString(e.name),
+      mode: modeFromTags(e.filters?.voting_tags),
+    };
+  }
   const mapPick = flattenPick(v.map?.pick)[0] ?? null;
   const mapEntity = (v.map?.entities ?? []).find(
     (e) => e.guid === mapPick || e.game_map_id === mapPick,
@@ -666,6 +697,7 @@ export function parseMatchDetail(body: unknown): ParsedDetail | null {
     : [];
 
   const winner = asString(d.results?.winner);
+  const status = normalizeStatus(d.status);
   const factionsSummary: Record<string, unknown> = {};
   const rosterEnrichment: ParsedDetail["rosterEnrichment"] = [];
   for (const [key, faction] of Object.entries(d.teams ?? {})) {
@@ -675,6 +707,13 @@ export function parseMatchDetail(body: unknown): ParsedDetail | null {
       avatar: asString(faction.avatar),
       score: asNumber(d.results?.score?.[key]),
     };
+    const result: ParsedDetail["rosterEnrichment"][number]["result"] = winner
+      ? winner === key
+        ? "win"
+        : "loss"
+      : status === "finished"
+        ? "draw"
+        : null;
     for (const r of faction.roster ?? []) {
       if (!r.player_id) continue;
       rosterEnrichment.push({
@@ -682,6 +721,7 @@ export function parseMatchDetail(body: unknown): ParsedDetail | null {
         membership: asString(r.membership),
         gameSkillLevel: asNumber(r.game_skill_level),
         gamePlayerName: asString(r.game_player_name),
+        result,
       });
     }
   }
@@ -696,7 +736,7 @@ export function parseMatchDetail(body: unknown): ParsedDetail | null {
       bestOf: statInt(d.best_of),
       round: asNumber(d.round),
       groupNum: asNumber(d.group),
-      status: normalizeStatus(d.status),
+      status,
       winnerFaction: winner,
       factionsJson: Object.keys(factionsSummary).length
         ? JSON.stringify(factionsSummary)
@@ -715,6 +755,7 @@ export function parseMatchDetail(body: unknown): ParsedDetail | null {
       faceitUrl: enUrl(d.faceit_url),
     },
     rosterEnrichment,
+    mapNames,
   };
 }
 
@@ -731,6 +772,16 @@ type StatsBody = {
       }>;
     }>;
   }>;
+};
+
+/** One map of a series, from `rounds[].round_stats`. */
+export type ParsedRound = {
+  roundIndex: number;
+  mapId: string | null;
+  mapName: string | null;
+  mapMode: string | null;
+  winnerTeamId: string | null;
+  scoreSummary: string | null;
 };
 
 export type ParsedScoreboardPlayer = {
@@ -765,9 +816,45 @@ function sumStat(rounds: Array<Record<string, string>>, key: string): number | n
   return any ? total : null;
 }
 
-export function parseMatchStats(body: unknown): ParsedScoreboardPlayer[] {
+export type ParsedStats = {
+  players: ParsedScoreboardPlayer[];
+  /** One entry per map actually played, in series order. */
+  rounds: ParsedRound[];
+};
+
+/**
+ * Parse `/matches/{id}/stats` into both halves of a match: the per-player
+ * scoreboard (aggregated across the series) and the per-map round list.
+ *
+ * `mapNames` comes from the match overview's veto entities — round_stats only
+ * carries the map's guid — so a caller without the overview still gets rounds,
+ * just unnamed ones.
+ */
+export function parseMatchStats(
+  body: unknown,
+  mapNames: Record<string, { name: string | null; mode: string | null }> = {},
+): ParsedStats {
   const s = body as StatsBody;
   const rounds = Array.isArray(s?.rounds) ? s.rounds : [];
+
+  // The maps, in the order they were played. `OW2 Mode` is on the round itself,
+  // which is also why these rows never inherit the veto's missing-tag problem
+  // (some organizers ship map entities with no filters at all, which is what
+  // used to split one map into "Lijiang Tower" and "Lijiang Tower · Control").
+  const parsedRounds: ParsedRound[] = rounds.map((r, i) => {
+    const rs = r.round_stats ?? {};
+    const mapId = asString(rs["Map"]);
+    const known = mapId ? mapNames[mapId] : undefined;
+    return {
+      roundIndex: i + 1,
+      mapId,
+      mapName: known?.name ?? null,
+      mapMode: asString(rs["OW2 Mode"]) ?? known?.mode ?? null,
+      winnerTeamId: asString(rs["Winner"]),
+      scoreSummary: asString(rs["Score Summary"]),
+    };
+  });
+
   // A player may appear in several rounds (Bo>1). Collect their per-round stat
   // maps, then aggregate countable columns; keep every round in stats_json.
   const byPlayer = new Map<
@@ -821,21 +908,29 @@ export function parseMatchStats(body: unknown): ParsedScoreboardPlayer[] {
       statsJson: JSON.stringify(rs.length === 1 ? rs[0] : rs),
     });
   }
-  return out;
+  return { players: out, rounds: parsedRounds };
 }
 
 /** The next matches (newest-first) that this player is in and that still miss
-    overview and/or scoreboard detail. */
+    overview, scoreboard and/or per-map round detail. */
 async function matchesNeedingDetail(
   db: FaceitDb,
   playerId: string,
   limit: number,
-): Promise<Array<{ matchId: string; needDetail: boolean; needStats: boolean }>> {
+): Promise<
+  Array<{
+    matchId: string;
+    needDetail: boolean;
+    needStats: boolean;
+    needRounds: boolean;
+  }>
+> {
   const rows = await db
     .select({
       matchId: faceitMatches.matchId,
       detailSyncedAt: faceitMatches.detailSyncedAt,
       statsSyncedAt: faceitMatches.statsSyncedAt,
+      roundsSyncedAt: faceitMatches.roundsSyncedAt,
       startedAt: faceitMatches.startedAt,
     })
     .from(faceitMatchPlayers)
@@ -843,7 +938,11 @@ async function matchesNeedingDetail(
     .where(
       and(
         eq(faceitMatchPlayers.playerId, playerId),
-        or(isNull(faceitMatches.detailSyncedAt), isNull(faceitMatches.statsSyncedAt)),
+        or(
+          isNull(faceitMatches.detailSyncedAt),
+          isNull(faceitMatches.statsSyncedAt),
+          isNull(faceitMatches.roundsSyncedAt),
+        ),
       ),
     )
     .orderBy(sql`${faceitMatches.startedAt} DESC`)
@@ -852,17 +951,60 @@ async function matchesNeedingDetail(
     matchId: r.matchId,
     needDetail: r.detailSyncedAt == null,
     needStats: r.statsSyncedAt == null,
+    needRounds: r.roundsSyncedAt == null,
   }));
+}
+
+/** Upsert one map of a series. The id is deterministic, so re-running a match's
+    detail is idempotent rather than duplicating its maps. */
+function matchRoundStmt(
+  db: FaceitDb,
+  matchId: string,
+  r: ParsedRound,
+  now: Date,
+) {
+  const values = {
+    id: `${matchId}:${r.roundIndex}`,
+    matchId,
+    roundIndex: r.roundIndex,
+    mapId: r.mapId,
+    mapName: r.mapName,
+    mapMode: r.mapMode,
+    winnerTeamId: r.winnerTeamId,
+    scoreSummary: r.scoreSummary,
+    updatedAt: now,
+  };
+  return db
+    .insert(faceitMatchRounds)
+    .values(values)
+    .onConflictDoUpdate({
+      target: faceitMatchRounds.id,
+      set: {
+        mapId: values.mapId,
+        // Don't blank a resolved name if a later parse can't name the guid.
+        ...(values.mapName ? { mapName: values.mapName } : {}),
+        ...(values.mapMode ? { mapMode: values.mapMode } : {}),
+        winnerTeamId: values.winnerTeamId,
+        scoreSummary: values.scoreSummary,
+        updatedAt: now,
+      },
+    });
 }
 
 export type DetailChunkResult = { processed: number; failed: number };
 
 /**
- * Fetch + store overview and scoreboard for up to `maxMatches` of this player's
- * matches that still need it, newest-first. Each match's two API calls run in
- * parallel; matches are processed sequentially to stay under the shared Data-API
- * rate limit. A failed match is left for the next tick (its *_synced_at stays
- * null), never marked done.
+ * Fetch + store overview, scoreboard and per-map rounds for up to `maxMatches` of
+ * this player's matches that still need it, newest-first. Each match's two API
+ * calls run in parallel; matches are processed sequentially to stay under the
+ * shared Data-API rate limit. A failed match is left for the next tick (its
+ * *_synced_at stays null), never marked done.
+ *
+ * A match needing only ROUNDS still fetches the overview: round_stats names its
+ * map with a bare guid, and the veto entity list is the only place that guid is
+ * given a name. That is a one-off cost per already-collected match while the
+ * rounds backfill runs, and it repairs that match's series `result` in the same
+ * pass.
  */
 export async function collectDetailChunk(
   db: FaceitDb,
@@ -874,22 +1016,32 @@ export async function collectDetailChunk(
   let processed = 0;
   let failed = 0;
 
-  for (const { matchId, needDetail, needStats } of due) {
+  for (const { matchId, needDetail, needStats, needRounds } of due) {
+    const wantDetail = needDetail || needRounds;
+    const wantStats = needStats || needRounds;
     const [detailRes, statsRes] = await Promise.all([
-      needDetail ? fetchJson(`${FACEIT_DATA}/matches/${matchId}`, apiKey) : Promise.resolve(null),
-      needStats ? fetchJson(`${FACEIT_DATA}/matches/${matchId}/stats`, apiKey) : Promise.resolve(null),
+      wantDetail ? fetchJson(`${FACEIT_DATA}/matches/${matchId}`, apiKey) : Promise.resolve(null),
+      wantStats ? fetchJson(`${FACEIT_DATA}/matches/${matchId}/stats`, apiKey) : Promise.resolve(null),
     ]);
     const now = new Date();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const stmts: any[] = [];
     let didSomething = false;
     let hadFailure = false;
+    /** guid → name/mode for this match's maps, filled by the overview below. */
+    let mapNames: ParsedDetail["mapNames"] = {};
+    /** Whether the map names are as good as they will ever get — false only
+     *  when the overview was wanted and failed, which holds the round rows back
+     *  so they aren't written permanently unnamed. */
+    let namesResolved = !wantDetail;
 
     // Overview.
-    if (needDetail) {
+    if (wantDetail) {
       if (detailRes && detailRes.status === 200) {
         const parsed = parseMatchDetail(detailRes.body);
         if (parsed) {
+          mapNames = parsed.mapNames;
+          namesResolved = true;
           stmts.push(
             db
               .update(faceitMatches)
@@ -904,6 +1056,9 @@ export async function collectDetailChunk(
                   ...(r.membership ? { membership: r.membership } : {}),
                   ...(r.gameSkillLevel != null ? { gameSkillLevel: r.gameSkillLevel } : {}),
                   ...(r.gamePlayerName ? { gamePlayerName: r.gamePlayerName } : {}),
+                  // Overwrites the list phase's first-map result with the series
+                  // one — the whole point of re-reading the overview.
+                  ...(r.result ? { result: r.result } : {}),
                   updatedAt: now,
                 })
                 .where(eq(faceitMatchPlayers.id, `${matchId}:${r.playerId}`)),
@@ -912,7 +1067,9 @@ export async function collectDetailChunk(
           didSomething = true;
         } else hadFailure = true;
       } else if (detailRes && detailRes.status === 404) {
-        // A genuinely gone match: mark detail done so it stops being retried.
+        // A genuinely gone match: mark detail done so it stops being retried,
+        // and let its rounds be written unnamed — nothing better will arrive.
+        namesResolved = true;
         stmts.push(
           db.update(faceitMatches).set({ detailSyncedAt: now, updatedAt: now }).where(eq(faceitMatches.matchId, matchId)),
         );
@@ -920,42 +1077,70 @@ export async function collectDetailChunk(
       } else hadFailure = true;
     }
 
-    // Scoreboard.
-    if (needStats) {
+    // Scoreboard + the per-map rounds (same payload).
+    if (wantStats) {
       if (statsRes && statsRes.status === 200) {
-        const scoreboard = parseMatchStats(statsRes.body);
-        for (const sp of scoreboard) {
+        const { players: scoreboard, rounds } = parseMatchStats(statsRes.body, mapNames);
+        // The scoreboard columns are already in place when only rounds are due.
+        if (needStats) {
+          for (const sp of scoreboard) {
+            stmts.push(
+              db
+                .update(faceitMatchPlayers)
+                .set({
+                  role: sp.role,
+                  eliminations: sp.eliminations,
+                  deaths: sp.deaths,
+                  assists: sp.assists,
+                  kdRatio: sp.kdRatio,
+                  damageDealt: sp.damageDealt,
+                  healingDone: sp.healingDone,
+                  damageMitigated: sp.damageMitigated,
+                  finalBlows: sp.finalBlows,
+                  soloKills: sp.soloKills,
+                  objectiveTime: sp.objectiveTime,
+                  timePlayed: sp.timePlayed,
+                  statsJson: sp.statsJson,
+                  ...(sp.nickname ? { nickname: sp.nickname } : {}),
+                  statsSyncedAt: now,
+                  updatedAt: now,
+                })
+                .where(eq(faceitMatchPlayers.id, `${matchId}:${sp.playerId}`)),
+            );
+          }
           stmts.push(
-            db
-              .update(faceitMatchPlayers)
-              .set({
-                role: sp.role,
-                eliminations: sp.eliminations,
-                deaths: sp.deaths,
-                assists: sp.assists,
-                kdRatio: sp.kdRatio,
-                damageDealt: sp.damageDealt,
-                healingDone: sp.healingDone,
-                damageMitigated: sp.damageMitigated,
-                finalBlows: sp.finalBlows,
-                soloKills: sp.soloKills,
-                objectiveTime: sp.objectiveTime,
-                timePlayed: sp.timePlayed,
-                statsJson: sp.statsJson,
-                ...(sp.nickname ? { nickname: sp.nickname } : {}),
-                statsSyncedAt: now,
-                updatedAt: now,
-              })
-              .where(eq(faceitMatchPlayers.id, `${matchId}:${sp.playerId}`)),
+            db.update(faceitMatches).set({ statsSyncedAt: now, updatedAt: now }).where(eq(faceitMatches.matchId, matchId)),
           );
         }
-        stmts.push(
-          db.update(faceitMatches).set({ statsSyncedAt: now, updatedAt: now }).where(eq(faceitMatches.matchId, matchId)),
-        );
+        if (needRounds && namesResolved) {
+          for (const r of rounds) stmts.push(matchRoundStmt(db, matchId, r, now));
+          // Drop any round beyond what this parse saw, so a re-read can shrink a
+          // series (the insert ids above never overlap this predicate, so the
+          // two are order-independent inside a batch).
+          stmts.push(
+            db
+              .delete(faceitMatchRounds)
+              .where(
+                and(
+                  eq(faceitMatchRounds.matchId, matchId),
+                  sql`${faceitMatchRounds.roundIndex} > ${rounds.length}`,
+                ),
+              ),
+          );
+          stmts.push(
+            db.update(faceitMatches).set({ roundsSyncedAt: now, updatedAt: now }).where(eq(faceitMatches.matchId, matchId)),
+          );
+        }
         didSomething = true;
       } else if (statsRes && statsRes.status === 404) {
+        // No scoreboard at all (old / forfeited matches). Mark both markers so
+        // the sweep stops offering it; FACEIT excludes these from its own
+        // per-map totals too.
         stmts.push(
-          db.update(faceitMatches).set({ statsSyncedAt: now, updatedAt: now }).where(eq(faceitMatches.matchId, matchId)),
+          db
+            .update(faceitMatches)
+            .set({ statsSyncedAt: now, roundsSyncedAt: now, updatedAt: now })
+            .where(eq(faceitMatches.matchId, matchId)),
         );
         didSomething = true;
       } else hadFailure = true;
@@ -973,7 +1158,10 @@ export async function collectDetailChunk(
 // Player-level bookkeeping
 // ---------------------------------------------------------------------------
 
-/** How many of this player's matches still lack overview/scoreboard detail. */
+/** How many of this player's matches still lack overview/scoreboard/round
+    detail. Including rounds here is what re-opens an already-"ready" player for
+    the one-off rounds backfill: their next search, advance or cron tick sees
+    outstanding work again and chips through it. */
 export async function countUndetailed(db: FaceitDb, playerId: string): Promise<number> {
   const [row] = await db
     .select({ n: sql<number>`count(*)` })
@@ -982,7 +1170,11 @@ export async function countUndetailed(db: FaceitDb, playerId: string): Promise<n
     .where(
       and(
         eq(faceitMatchPlayers.playerId, playerId),
-        or(isNull(faceitMatches.detailSyncedAt), isNull(faceitMatches.statsSyncedAt)),
+        or(
+          isNull(faceitMatches.detailSyncedAt),
+          isNull(faceitMatches.statsSyncedAt),
+          isNull(faceitMatches.roundsSyncedAt),
+        ),
       ),
     );
   return Number(row?.n ?? 0);

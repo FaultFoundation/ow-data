@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import { owPlayers, owSnapshots, pdSync } from "./ow-schema";
 import {
   faceitMatchPlayers,
+  faceitMatchRounds,
   faceitMatches,
   faceitPlayers,
 } from "./faceit-schema";
@@ -265,7 +266,7 @@ const FACEIT_CRON_MAX_PLAYERS = 8;
 type FaceitDbHandle = ReturnType<typeof faceitDb>;
 function faceitDb(env: Env) {
   return drizzle(env.OW, {
-    schema: { faceitPlayers, faceitMatches, faceitMatchPlayers },
+    schema: { faceitPlayers, faceitMatches, faceitMatchPlayers, faceitMatchRounds },
   });
 }
 
