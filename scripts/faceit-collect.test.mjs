@@ -139,3 +139,28 @@ test('per-player scoreboard scalars still aggregate across the series', () => {
   assert.equal(me.kdRatio, 4);
   assert.equal(me.role, 'Tank');
 });
+
+const { parseVoting } = load(resolve(src, 'faceit-voting.ts'));
+test('voting keeps bans per game and matches attribution without ticket position', () => {
+  const entity = (guid) => ({ guid, name: guid });
+  const match = { payload: { id: 'm', teams: { faction1: { name: 'A' }, faction2: { name: 'B' } }, voting: {
+    map: { entities: [entity('map1'), entity('map2')], pick: ['map1', 'map2'] },
+    heroes: { entities: [entity('Ana'), entity('Mauga'), entity('Mei')], pick: [['Mei'], ['Ana']] },
+  } } };
+  const history = { payload: { match_id: 'm', tickets: [
+    { entity_type: 'heroes', entities: [{ guid: 'Mauga', status: 'drop', selected_by: 'faction2' }, { guid: 'Mei', status: 'drop', selected_by: 'faction1' }] },
+    { entity_type: 'map', entities: [{ guid: 'map1', status: 'pick', selected_by: 'faction1' }, { guid: 'map2', status: 'drop', selected_by: '' }] },
+    { entity_type: 'heroes', entities: [{ guid: 'Ana', status: 'drop', selected_by: 'faction1' }, { guid: 'Mauga', status: 'drop', selected_by: 'faction2' }] },
+  ] } };
+  const v = parseVoting(match, history);
+  assert.equal(v.games[0].heroBans.length, 2);
+  assert.equal(v.games[1].heroBans.length, 2);
+  assert.equal(v.games[0].heroBans[0].by, 'faction1');
+  assert.equal(v.games[0].pickedBy, 'faction1');
+  assert.equal(v.games[0].mapBans.length, 0);
+  assert.equal(v.games[1].pickedBy, null);
+  assert.equal(parseVoting(match, null).games[0].heroBans[0].by, null);
+  assert.equal(parseVoting(match, { payload: { match_id: 'wrong', tickets: [] } }), null);
+  history.payload.tickets.push(history.payload.tickets[2]);
+  assert.equal(parseVoting(match, history).games[0].heroBans[0].by, null);
+});

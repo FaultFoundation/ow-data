@@ -1,3 +1,4 @@
+import { parseVoting } from "./faceit-voting";
 import { and, eq, isNull, or, sql } from "drizzle-orm";
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 
@@ -102,7 +103,7 @@ async function fetchJson(
 ): Promise<{ status: number; body: unknown } | null> {
   try {
     const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${apiKey}` },
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : { "User-Agent": "Commons-FACEIT-Collector/1.0" },
       signal: AbortSignal.timeout(FACEIT_TIMEOUT_MS),
     });
     const body = (await res.json().catch(() => null)) as unknown;
@@ -684,11 +685,16 @@ export function parseMatchDetail(body: unknown): ParsedDetail | null {
 
   // Hero bans: the votable pool MINUS the picked (kept) heroes.
   const heroEntities = v.heroes?.entities ?? [];
-  const kept = new Set(flattenPick(v.heroes?.pick));
+  // Legacy summary is the union of per-game bans, never pool minus the
+  // union of survivors (which erases heroes banned on only one map).
+  const heroPicks = v.heroes?.pick;
+  const survivorSets = Array.isArray(heroPicks) && heroPicks.some(Array.isArray)
+    ? heroPicks.filter(Array.isArray).map((p) => new Set(flattenPick(p)))
+    : Array.isArray(heroPicks) ? [new Set(flattenPick(heroPicks))] : [];
   const heroBans = heroEntities
     .filter((e) => {
       const id = e.guid ?? e.game_heroes_id;
-      return id != null && !kept.has(id);
+      return id != null && survivorSets.some((kept) => !kept.has(id));
     })
     .map((e) => ({ guid: e.guid ?? e.game_heroes_id ?? null, name: e.name ?? null }));
 
@@ -920,6 +926,7 @@ async function matchesNeedingDetail(
 ): Promise<
   Array<{
     matchId: string;
+    needVoting: boolean;
     needDetail: boolean;
     needStats: boolean;
     needRounds: boolean;
@@ -928,6 +935,7 @@ async function matchesNeedingDetail(
   const rows = await db
     .select({
       matchId: faceitMatches.matchId,
+      votingSyncedAt: faceitMatches.votingSyncedAt,
       detailSyncedAt: faceitMatches.detailSyncedAt,
       statsSyncedAt: faceitMatches.statsSyncedAt,
       roundsSyncedAt: faceitMatches.roundsSyncedAt,
@@ -939,6 +947,7 @@ async function matchesNeedingDetail(
       and(
         eq(faceitMatchPlayers.playerId, playerId),
         or(
+          isNull(faceitMatches.votingSyncedAt),
           isNull(faceitMatches.detailSyncedAt),
           isNull(faceitMatches.statsSyncedAt),
           isNull(faceitMatches.roundsSyncedAt),
@@ -949,6 +958,7 @@ async function matchesNeedingDetail(
     .limit(limit);
   return rows.map((r) => ({
     matchId: r.matchId,
+    needVoting: r.votingSyncedAt == null,
     needDetail: r.detailSyncedAt == null,
     needStats: r.statsSyncedAt == null,
     needRounds: r.roundsSyncedAt == null,
@@ -1016,7 +1026,7 @@ export async function collectDetailChunk(
   let processed = 0;
   let failed = 0;
 
-  for (const { matchId, needDetail, needStats, needRounds } of due) {
+  for (const { matchId, needVoting, needDetail, needStats, needRounds } of due) {
     const wantDetail = needDetail || needRounds;
     const wantStats = needStats || needRounds;
     const [detailRes, statsRes] = await Promise.all([
@@ -1034,6 +1044,23 @@ export async function collectDetailChunk(
      *  when the overview was wanted and failed, which holds the round rows back
      *  so they aren't written permanently unnamed. */
     let namesResolved = !wantDetail;
+
+    if (needVoting) {
+      const [matchRes, historyRes] = await Promise.all([
+        fetchJson(`https://api.faceit.com/match/v2/match/${matchId}`, ""),
+        fetchJson(`https://api.faceit.com/democracy/v1/match/${matchId}/history`, ""),
+      ]);
+      if (matchRes?.status === 200 && (historyRes?.status === 200 || historyRes?.status === 404)) {
+        const voting = parseVoting(matchRes.body, historyRes.status === 200 ? historyRes.body : null);
+        if (voting) {
+          stmts.push(db.update(faceitMatches).set({ votingJson: JSON.stringify(voting), votingSyncedAt: now, updatedAt: now }).where(eq(faceitMatches.matchId, matchId)));
+          didSomething = true;
+        } else hadFailure = true;
+      } else if (matchRes?.status === 404) {
+        stmts.push(db.update(faceitMatches).set({ votingSyncedAt: now }).where(eq(faceitMatches.matchId, matchId)));
+        didSomething = true;
+      } else hadFailure = true;
+    }
 
     // Overview.
     if (wantDetail) {
@@ -1171,6 +1198,7 @@ export async function countUndetailed(db: FaceitDb, playerId: string): Promise<n
       and(
         eq(faceitMatchPlayers.playerId, playerId),
         or(
+          isNull(faceitMatches.votingSyncedAt),
           isNull(faceitMatches.detailSyncedAt),
           isNull(faceitMatches.statsSyncedAt),
           isNull(faceitMatches.roundsSyncedAt),

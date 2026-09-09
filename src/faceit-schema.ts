@@ -150,6 +150,8 @@ export const faceitMatches = sqliteTable(
     mapMode: text("map_mode"),
     /** Banned heroes as [{ guid, name }] (entities − pick from the veto). */
     heroBansJson: text("hero_bans_json"),
+    votingJson: text("voting_json"),
+    votingSyncedAt: integer("voting_synced_at", { mode: "timestamp_ms" }),
     /** Replay/demo codes as ["8C5DGE"] (from demo_url). */
     replayCodesJson: text("replay_codes_json"),
     /** Faction that attacked first, when the mode has one. */
