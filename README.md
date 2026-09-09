@@ -67,12 +67,22 @@ plan's per-request subrequest cap:
 `POST /faceit/search?nickname=…&mode=quick|deep` (bearer = `OW_POLLER_SECRET`)
 resolves the player, does one list page synchronously, and continues in the
 background (`waitUntil`); the hourly cron finishes any backfill still in flight.
-**quick** fills detail lazily; **deep** front-loads it with bigger budgets. Icons
-(hero / map / server) are deliberately **not** stored — only player avatars.
+**quick** aims at the recent ~50 games' detail (one list page + a detail burst);
+**deep** is driven to completion by the Commons via `POST /faceit/advance` (below).
+
+`POST /faceit/advance?player_id=…&mode=quick|deep` (same bearer) pushes an
+already-registered player's collection forward by one **bounded, synchronous**
+chunk (no `waitUntil`, since the caller waits on it) and returns the progress
+counts (`status`, `matchCount`, `undetailed`, `listDone`, `detailDone`). The
+Commons deep search loops this behind a load screen until the whole history is in
+or a client safety cap is hit. Icons (hero / map / server) are deliberately **not**
+stored — only player avatars.
 
 ```sh
 curl -X POST -H "authorization: Bearer $OW_POLLER_SECRET" \
-  "http://localhost:8787/faceit/search?nickname=Jakal_OW&mode=quick"
+  "http://localhost:8787/faceit/search?nickname=Jakal_OW&mode=deep"
+curl -X POST -H "authorization: Bearer $OW_POLLER_SECRET" \
+  "http://localhost:8787/faceit/advance?player_id=<guid>&mode=deep"
 curl -H "authorization: Bearer $OW_POLLER_SECRET" \
   "http://localhost:8787/faceit/player?nickname=Jakal_OW&limit=50"
 ```

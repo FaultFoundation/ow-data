@@ -23,6 +23,7 @@ import {
 import {
   collectDetailChunk,
   collectListChunk,
+  countUndetailed,
   finalizePlayerState,
   resolveFaceitPlayer,
   upsertProfileStmt,
@@ -223,8 +224,11 @@ async function pollPlayerDataHour(env: Env, hour: number): Promise<PdPollResult>
 // then per-match overview + scoreboard DETAIL). The hourly cron finishes any
 // backfill still in flight; the Commons reads the faceit_* rows directly.
 //
-// "quick" surfaces the list fast and fills detail lazily; "deep" front-loads the
-// detail with bigger budgets. Same engine (faceit-collect.ts), different budgets.
+// "quick" surfaces the recent ~50 games' detail fast (one list page + a detail
+// burst) and leaves the long tail to cron. "deep" is driven to completion by the
+// Commons: after the trigger it loops POST /faceit/advance (a bounded SYNCHRONOUS
+// chunk each call, returning progress counts) until list + detail are done or a
+// safety cap is hit. Same engine (faceit-collect.ts), different budgets.
 // ---------------------------------------------------------------------------
 
 type FaceitBudget = { listPages: number; detailMatches: number };
@@ -232,8 +236,23 @@ type FaceitBudget = { listPages: number; detailMatches: number };
 // The trigger returns fast: one list page synchronously, the rest in waitUntil.
 const FACEIT_TRIGGER_SYNC: FaceitBudget = { listPages: 1, detailMatches: 0 };
 const FACEIT_WAITUNTIL: Record<"quick" | "deep", FaceitBudget> = {
-  quick: { listPages: 3, detailMatches: 8 },
+  // Quick aims at the recent ~50 games detailed fast: one list page (newest 100)
+  // and detail the newest ~48, so maps + scoreboards surface without paging all
+  // history. Deep front-loads a first burst; the /faceit/advance loop (driven by
+  // the Commons deep search) finishes the rest.
+  quick: { listPages: 1, detailMatches: 48 },
   deep: { listPages: 8, detailMatches: 30 },
+};
+// Per-call budget for POST /faceit/advance — the synchronous "drive to
+// completion" the Commons deep search polls. Bigger than a cron chunk (the
+// caller is waiting), still well under the 1000-subrequest cap (detail = 2
+// calls each, so deep = ~96 subrequests/call).
+const FACEIT_ADVANCE: Record<"quick" | "deep", FaceitBudget> = {
+  quick: { listPages: 2, detailMatches: 16 },
+  // Kept intentionally modest so each call returns in a handful of seconds and
+  // the deep loading bar advances smoothly across many calls, rather than one
+  // long-running request that risks the caller's timeout.
+  deep: { listPages: 6, detailMatches: 24 },
 };
 // Cron chips away at anything still unfinished, bounded so one tick stays under
 // the subrequest cap even across several due players.
@@ -462,6 +481,56 @@ async function handleFaceitSearch(
   });
 }
 
+/**
+ * Handle POST /faceit/advance — drive an already-registered player's collection
+ * forward by one bounded, SYNCHRONOUS chunk (no waitUntil: the Commons deep
+ * search is waiting on the response and loops this until done). Returns the
+ * progress counts the deep loading bar reads. Never resolves the profile again,
+ * so a deep loop costs no extra FACEIT search calls.
+ */
+async function handleFaceitAdvance(env: Env, url: URL): Promise<Response> {
+  if (!env.FACEIT_API_KEY) return json({ error: "FACEIT not configured" }, 503);
+  const playerId = url.searchParams.get("player_id") ?? undefined;
+  const mode = url.searchParams.get("mode") === "deep" ? "deep" : "quick";
+  if (!playerId) return json({ error: "player_id required" }, 400);
+
+  const db = faceitDb(env);
+  const [row] = await db
+    .select({
+      playerId: faceitPlayers.playerId,
+      game: faceitPlayers.game,
+      listOffset: faceitPlayers.listOffset,
+      listDone: faceitPlayers.listDone,
+      detailDone: faceitPlayers.detailDone,
+      searchMode: faceitPlayers.searchMode,
+    })
+    .from(faceitPlayers)
+    .where(eq(faceitPlayers.playerId, playerId));
+  if (!row) return json({ error: "not collected yet" }, 404);
+
+  const state = await advanceFaceitPlayer(
+    db,
+    env.FACEIT_API_KEY,
+    {
+      playerId: row.playerId,
+      game: row.game,
+      listOffset: row.listOffset,
+      listDone: row.listDone,
+      detailDone: row.detailDone,
+      searchMode: row.searchMode,
+    },
+    FACEIT_ADVANCE[mode],
+  );
+  const undetailed = await countUndetailed(db, row.playerId);
+  return json({
+    status: state.listDone && state.detailDone ? "ready" : "collecting",
+    matchCount: state.matchCount,
+    undetailed,
+    listDone: state.listDone,
+    detailDone: state.detailDone,
+  });
+}
+
 /** Read the cached collection for a player (identity + matches + scoreboard). */
 async function handleFaceitRead(env: Env, url: URL): Promise<Response> {
   const playerId = url.searchParams.get("player_id") ?? undefined;
@@ -544,6 +613,13 @@ export default {
         return json({ error: "unauthorized" }, 401);
       }
       return handleFaceitSearch(request, env, ctx, url);
+    }
+    if (url.pathname === "/faceit/advance" && request.method === "POST") {
+      if (!env.OW_POLLER_SECRET) return json({ error: "not configured" }, 503);
+      if (!bearerOk(request.headers.get("authorization"), env.OW_POLLER_SECRET)) {
+        return json({ error: "unauthorized" }, 401);
+      }
+      return handleFaceitAdvance(env, url);
     }
     if (url.pathname === "/faceit/player" && request.method === "GET") {
       if (!env.OW_POLLER_SECRET) return json({ error: "not configured" }, 503);
