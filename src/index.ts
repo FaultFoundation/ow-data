@@ -249,11 +249,11 @@ const FACEIT_WAITUNTIL: Record<"quick" | "deep", FaceitBudget> = {
 // caller is waiting), still well under the 1000-subrequest cap (detail = 2
 // calls each, so deep = ~96 subrequests/call).
 const FACEIT_ADVANCE: Record<"quick" | "deep", FaceitBudget> = {
-  quick: { listPages: 2, detailMatches: 16 },
+  quick: { listPages: 1, detailMatches: 16 },
   // Kept intentionally modest so each call returns in a handful of seconds and
   // the deep loading bar advances smoothly across many calls, rather than one
   // long-running request that risks the caller's timeout.
-  deep: { listPages: 6, detailMatches: 24 },
+  deep: { listPages: 1, detailMatches: 24 },
 };
 // Cron chips away at anything still unfinished, bounded so one tick stays under
 // the subrequest cap even across several due players.
@@ -289,6 +289,7 @@ async function advanceFaceitPlayer(
   apiKey: string,
   row: FaceitPlayerRow,
   budget: FaceitBudget,
+  stopAtMs = Infinity,
 ): Promise<{ matchCount: number; listDone: boolean; detailDone: boolean }> {
   let listOffset = row.listOffset;
   let listDone = row.listDone;
@@ -307,7 +308,7 @@ async function advanceFaceitPlayer(
   }
 
   if (budget.detailMatches > 0) {
-    const d = await collectDetailChunk(db, apiKey, row.playerId, budget.detailMatches);
+    const d = await collectDetailChunk(db, apiKey, row.playerId, budget.detailMatches, stopAtMs);
     if (d.failed > 0) failed = true;
   }
 
@@ -433,8 +434,9 @@ async function handleFaceitSearch(
     FACEIT_TRIGGER_SYNC,
   );
 
-  // Background: continue list + fill detail without holding the response.
-  ctx.waitUntil(
+  // Quick fills detail in the background. Deep has a synchronous /advance
+  // driver; a second collector here races its cursor and duplicates provider calls.
+  if (mode === "quick") ctx.waitUntil(
     (async () => {
       try {
         const [fresh] = await db
@@ -521,6 +523,7 @@ async function handleFaceitAdvance(env: Env, url: URL): Promise<Response> {
       searchMode: row.searchMode,
     },
     FACEIT_ADVANCE[mode],
+    Date.now() + 10_000,
   );
   const undetailed = await countUndetailed(db, row.playerId);
   return json({

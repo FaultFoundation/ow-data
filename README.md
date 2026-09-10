@@ -105,7 +105,11 @@ already-registered player's collection forward by one **bounded, synchronous**
 chunk (no `waitUntil`, since the caller waits on it) and returns the progress
 counts (`status`, `matchCount`, `undetailed`, `listDone`, `detailDone`). The
 Commons deep search loops this behind a load screen until the whole history is in
-or a client safety cap is hit. Icons (hero / map / server) are deliberately **not**
+or repeated provider/network failures interrupt it. Successful chunks have no
+client match/request cap. Each advance pages once, then stops starting new match
+requests after ten seconds, allowing up to sixteen seconds for the final match's
+provider requests before the Commons' thirty-second timeout. Deep searches use
+only this driver; quick searches keep their background burst. Icons (hero / map / server) are deliberately **not**
 stored — only player avatars.
 
 Pure parsers are unit-tested against these shapes — `npm test` (node:test; the

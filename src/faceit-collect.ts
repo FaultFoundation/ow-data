@@ -1021,12 +1021,16 @@ export async function collectDetailChunk(
   apiKey: string,
   playerId: string,
   maxMatches: number,
+  stopAtMs = Infinity,
 ): Promise<DetailChunkResult> {
   const due = await matchesNeedingDetail(db, playerId, maxMatches);
   let processed = 0;
   let failed = 0;
 
   for (const { matchId, needVoting, needDetail, needStats, needRounds } of due) {
+    // A match can need two sequential pairs of 8-second provider requests.
+    // Stop between matches, leaving room for the last in-flight pair and D1.
+    if (Date.now() >= stopAtMs) break;
     const wantDetail = needDetail || needRounds;
     const wantStats = needStats || needRounds;
     const [detailRes, statsRes] = await Promise.all([

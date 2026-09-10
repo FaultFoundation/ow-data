@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import { drizzle } from 'drizzle-orm/d1';
 import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
 import { runInNewContext } from 'node:vm';
@@ -24,7 +26,7 @@ import ts from 'typescript';
 const require = createRequire(import.meta.url);
 const src = resolve(import.meta.dirname, '..', 'src');
 
-function load(file) {
+function load(file, globals = {}) {
   const path = file.endsWith('.ts') ? file : `${file}.ts`;
   const code = ts.transpileModule(readFileSync(path, 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
@@ -32,8 +34,8 @@ function load(file) {
   const exports = {};
   runInNewContext(code, {
     exports,
-    require: (id) => (id.startsWith('.') ? load(resolve(dirname(path), id)) : require(id)),
-    Date, console,
+    require: (id) => (id.startsWith('.') ? load(resolve(dirname(path), id), globals) : require(id)),
+    Date, console, ...globals,
   }, { filename: path });
   return exports;
 }
@@ -163,4 +165,37 @@ test('voting keeps bans per game and matches attribution without ticket position
   assert.equal(parseVoting(match, { payload: { match_id: 'wrong', tickets: [] } }), null);
   history.payload.tickets.push(history.payload.tickets[2]);
   assert.equal(parseVoting(match, history).games[0].heroBans[0].by, null);
+});
+
+
+test('detail deadline preserves completed work and resumes remaining matches', async () => {
+  const sqlite = new DatabaseSync(':memory:');
+  for (const file of readdirSync(resolve(src, '../drizzle-faceit')).filter(f => f.endsWith('.sql')).sort()) {
+    sqlite.exec(readFileSync(resolve(src, '../drizzle-faceit', file), 'utf8'));
+  }
+  const client = { prepare(sql) { return { bind(...params) { return {
+    async raw() { const stmt = sqlite.prepare(sql); stmt.setReturnArrays(true); return stmt.all(...params); },
+    async all() { return { results: sqlite.prepare(sql).all(...params), meta: {} }; },
+    async run() { return { meta: sqlite.prepare(sql).run(...params) }; },
+  }; } }; }, async batch(statements) { return Promise.all(statements.map(s => s.all())); } };
+  for (const id of ['m1', 'm2']) {
+    sqlite.prepare('INSERT INTO faceit_matches (match_id,created_at,updated_at) VALUES (?,0,0)').run(id);
+    sqlite.prepare('INSERT INTO faceit_match_players (id,match_id,player_id,created_at,updated_at) VALUES (?,?,?,0,0)').run(id+':p1',id,'p1');
+  }
+  let now = 0;
+  let requests = 0;
+  class Clock extends Date { static now() { return now; } }
+  const { collectDetailChunk, countUndetailed } = load(resolve(src, 'faceit-collect.ts'), {
+    Date: Clock, AbortSignal,
+    fetch: async () => { requests++; now += 6000; return { status: 404, json: async () => null }; },
+  });
+  const db = drizzle(client);
+  try {
+    await collectDetailChunk(db, 'test-key', 'p1', 24, 10_000);
+    assert.equal(requests, 4, 'finish one match, do not start the next after deadline');
+    assert.equal(await countUndetailed(db, 'p1'), 1);
+    await collectDetailChunk(db, 'test-key', 'p1', 24, now + 10_000);
+    assert.equal(requests, 8);
+    assert.equal(await countUndetailed(db, 'p1'), 0);
+  } finally { sqlite.close(); }
 });
