@@ -199,3 +199,46 @@ test('detail deadline preserves completed work and resumes remaining matches', a
     assert.equal(await countUndetailed(db, 'p1'), 0);
   } finally { sqlite.close(); }
 });
+
+test('finished matches without a veto complete, while unavailable or malformed voting retries', async () => {
+  const sqlite = new DatabaseSync(':memory:');
+  for (const file of readdirSync(resolve(src, '../drizzle-faceit')).filter(f => f.endsWith('.sql')).sort()) {
+    sqlite.exec(readFileSync(resolve(src, '../drizzle-faceit', file), 'utf8'));
+  }
+  const client = { prepare(sql) { return { bind(...params) { return {
+    async raw() { const stmt = sqlite.prepare(sql); stmt.setReturnArrays(true); return stmt.all(...params); },
+    async all() { return { results: sqlite.prepare(sql).all(...params), meta: {} }; },
+  }; } }; }, async batch(statements) { return Promise.all(statements.map(s => s.all())); } };
+  const scenarios = [
+    { id: 'no-veto', payload: { id: 'no-veto', status: 'FINISHED' }, historyStatus: 404, complete: true },
+    { id: 'null-veto', payload: { id: 'null-veto', status: 'FINISHED', voting: null }, historyStatus: 404, complete: true },
+    { id: 'outage', payload: { id: 'outage', status: 'FINISHED' }, historyStatus: 503, complete: false },
+    { id: 'rate-limit', payload: { id: 'rate-limit', status: 'FINISHED' }, historyStatus: 429, complete: false },
+    { id: 'active', payload: { id: 'active', status: 'ONGOING' }, historyStatus: 404, complete: false },
+    { id: 'malformed', payload: {}, historyStatus: 404, complete: false },
+    { id: 'wrong-id', payload: { id: 'another-match', status: 'FINISHED' }, historyStatus: 404, complete: false },
+  ];
+  const db = drizzle(client);
+  try {
+    for (const scenario of scenarios) {
+      sqlite.prepare('INSERT INTO faceit_matches (match_id,detail_synced_at,stats_synced_at,rounds_synced_at,created_at,updated_at) VALUES (?,1,1,1,0,0)').run(scenario.id);
+      sqlite.prepare('INSERT INTO faceit_match_players (id,match_id,player_id,created_at,updated_at) VALUES (?,?,?,0,0)').run(scenario.id+':p',scenario.id,scenario.id);
+      let requests = 0;
+      const { collectDetailChunk, countUndetailed } = load(resolve(src, 'faceit-collect.ts'), {
+        AbortSignal, fetch: async url => {
+          requests++;
+          return url.includes('/history')
+            ? { status: scenario.historyStatus, json: async () => null }
+            : { status: 200, json: async () => ({ payload: scenario.payload }) };
+        },
+      });
+      await collectDetailChunk(db, 'test-key', scenario.id, 24);
+      assert.equal(await countUndetailed(db, scenario.id), scenario.complete ? 0 : 1, scenario.id);
+      const row = sqlite.prepare('SELECT voting_json, voting_synced_at FROM faceit_matches WHERE match_id = ?').get(scenario.id);
+      assert.equal(row.voting_json, null, 'never fabricate voting data');
+      assert.equal(row.voting_synced_at !== null, scenario.complete, scenario.id);
+      await collectDetailChunk(db, 'test-key', scenario.id, 24);
+      assert.equal(requests, scenario.complete ? 2 : 4, scenario.id);
+    }
+  } finally { sqlite.close(); }
+});

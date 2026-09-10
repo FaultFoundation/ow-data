@@ -1056,7 +1056,18 @@ export async function collectDetailChunk(
       ]);
       if (matchRes?.status === 200 && (historyRes?.status === 200 || historyRes?.status === 404)) {
         const voting = parseVoting(matchRes.body, historyRes.status === 200 ? historyRes.body : null);
-        if (voting) {
+        const payload = (matchRes.body as { payload?: { id?: string; status?: string; voting?: unknown } } | null)?.payload;
+        // Finished matches can legitimately have no veto phase. FACEIT returns
+        // the match without `voting` and a 404 history for these, forever.
+        // Record confirmed absence without inventing ban data. Malformed
+        // responses, active matches and transient history failures still retry.
+        const noVoting = payload?.id === matchId &&
+          payload.status === "FINISHED" && payload.voting == null &&
+          historyRes.status === 404;
+        if (noVoting) {
+          stmts.push(db.update(faceitMatches).set({ votingJson: null, votingSyncedAt: now, updatedAt: now }).where(eq(faceitMatches.matchId, matchId)));
+          didSomething = true;
+        } else if (voting) {
           stmts.push(db.update(faceitMatches).set({ votingJson: JSON.stringify(voting), votingSyncedAt: now, updatedAt: now }).where(eq(faceitMatches.matchId, matchId)));
           didSomething = true;
         } else hadFailure = true;
