@@ -1,5 +1,5 @@
 import { parseVoting } from "./faceit-voting";
-import { and, eq, isNull, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 
 import {
@@ -97,7 +97,7 @@ export function chunkForPlayer(playerId: string): number {
   return h % 24;
 }
 
-async function fetchJson(
+export async function fetchJson(
   url: string,
   apiKey: string,
 ): Promise<{ status: number; body: unknown } | null> {
@@ -416,7 +416,7 @@ export function upsertProfileStmt(
     });
 }
 
-function matchSummaryStmt(db: FaceitDb, m: Record<string, unknown>, now: Date) {
+export function matchSummaryStmt(db: FaceitDb, m: Record<string, unknown>, now: Date) {
   // List-phase columns only; overview/scoreboard columns are left for DETAIL,
   // so an incoming list re-page never clobbers already-collected detail.
   return db
@@ -434,8 +434,8 @@ function matchSummaryStmt(db: FaceitDb, m: Record<string, unknown>, now: Date) {
         gameMode: m.gameMode as string | null,
         matchType: m.matchType as string | null,
         status: m.status as string,
-        winnerFaction: m.winnerFaction as string | null,
-        factionsJson: m.factionsJson as string | null,
+        winnerFaction: sql`case when ${faceitMatches.detailSyncedAt} is not null then ${faceitMatches.winnerFaction} else ${m.winnerFaction ?? null} end`,
+        factionsJson: sql`case when ${faceitMatches.detailSyncedAt} is not null then ${faceitMatches.factionsJson} else ${m.factionsJson ?? null} end`,
         startedAt: m.startedAt as Date | null,
         finishedAt: m.finishedAt as Date | null,
         faceitUrl: m.faceitUrl as string | null,
@@ -444,7 +444,7 @@ function matchSummaryStmt(db: FaceitDb, m: Record<string, unknown>, now: Date) {
     });
 }
 
-function matchPlayerListStmt(
+export function matchPlayerListStmt(
   db: FaceitDb,
   matchId: string,
   p: ParsedMatchPlayer,
@@ -476,7 +476,7 @@ function matchPlayerListStmt(
         ...(p.gamePlayerId ? { gamePlayerId: p.gamePlayerId } : {}),
         ...(p.gamePlayerName ? { gamePlayerName: p.gamePlayerName } : {}),
         ...(p.gameSkillLevel != null ? { gameSkillLevel: p.gameSkillLevel } : {}),
-        result: p.result,
+        result: sql`case when exists (select 1 from faceit_matches m where m.match_id=${matchId} and m.detail_synced_at is not null) then ${faceitMatchPlayers.result} else ${p.result} end`,
         updatedAt: now,
       },
     });
@@ -923,6 +923,7 @@ async function matchesNeedingDetail(
   db: FaceitDb,
   playerId: string,
   limit: number,
+  matchIds?: string[],
 ): Promise<
   Array<{
     matchId: string;
@@ -932,20 +933,20 @@ async function matchesNeedingDetail(
     needRounds: boolean;
   }>
 > {
-  const rows = await db
-    .select({
+  const selection = {
       matchId: faceitMatches.matchId,
       votingSyncedAt: faceitMatches.votingSyncedAt,
       detailSyncedAt: faceitMatches.detailSyncedAt,
       statsSyncedAt: faceitMatches.statsSyncedAt,
       roundsSyncedAt: faceitMatches.roundsSyncedAt,
       startedAt: faceitMatches.startedAt,
-    })
-    .from(faceitMatchPlayers)
-    .innerJoin(faceitMatches, eq(faceitMatchPlayers.matchId, faceitMatches.matchId))
-    .where(
+    };
+  const source = matchIds
+    ? db.select(selection).from(faceitMatches).$dynamic()
+    : db.select(selection).from(faceitMatchPlayers).innerJoin(faceitMatches, eq(faceitMatchPlayers.matchId, faceitMatches.matchId)).$dynamic();
+  const rows = await source.where(
       and(
-        eq(faceitMatchPlayers.playerId, playerId),
+        matchIds ? inArray(faceitMatches.matchId, matchIds) : eq(faceitMatchPlayers.playerId, playerId),
         or(
           isNull(faceitMatches.votingSyncedAt),
           isNull(faceitMatches.detailSyncedAt),
@@ -1022,8 +1023,9 @@ export async function collectDetailChunk(
   playerId: string,
   maxMatches: number,
   stopAtMs = Infinity,
+  matchIds?: string[],
 ): Promise<DetailChunkResult> {
-  const due = await matchesNeedingDetail(db, playerId, maxMatches);
+  const due = await matchesNeedingDetail(db, playerId, maxMatches, matchIds);
   let processed = 0;
   let failed = 0;
 

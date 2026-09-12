@@ -299,3 +299,21 @@ export const faceitMatchPlayers = sqliteTable(
     index("faceit_match_players_player_idx").on(t.playerId),
   ],
 );
+
+/** Team search state. History membership comes exclusively from the team stats feed. */
+export const faceitScoutTeams = sqliteTable("faceit_scout_teams", {
+  teamId: text("team_id").primaryKey(),
+  name: text("name").notNull(),
+  nickname: text("nickname").notNull(),
+  avatarUrl: text("avatar_url"),
+  rosterJson: text("roster_json").notNull(),
+  searchMode: text("search_mode").notNull(),
+  listPage: integer("list_page").notNull().default(0),
+  listDone: integer("list_done", { mode: "boolean" }).notNull().default(false),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+});
+export const faceitScoutTeamMatches = sqliteTable("faceit_scout_team_matches", {
+  id: text("id").primaryKey(),
+  teamId: text("team_id").notNull(),
+  matchId: text("match_id").notNull(),
+}, (t) => [index("faceit_scout_team_matches_team_idx").on(t.teamId)]);

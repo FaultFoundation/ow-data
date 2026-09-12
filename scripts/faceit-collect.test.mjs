@@ -242,3 +242,86 @@ test('finished matches without a veto complete, while unavailable or malformed v
     }
   } finally { sqlite.close(); }
 });
+
+test('team lookup resolves exact name(tag), deduplicates roster, and rejects fuzzy names', async () => {
+  const calls = [];
+  const team = { team_id: 'df36dcb1-6397-4f2d-8fca-562bad8f307f', game:'ow2', name:'LGBTQI-AIM', nickname:'AIM', members:[{ user_id:'p1', nickname:'AliveFPS' }, { user_id:'p1', nickname:'AliveFPS' }] };
+  const { resolveFaceitTeam, teamSearchParts, parseTeamProfile } = load(resolve(src,'faceit-team-collect.ts'), {
+    URLSearchParams, AbortSignal,
+    fetch: async url => { calls.push(url); return { status:200, json: async () => url.includes('/search/teams') ? { items:[{ team_id:team.team_id, name:team.name }, { team_id:'unrelated', name:'Rizz Aim' }] } : team }; },
+  });
+  const result = await resolveFaceitTeam('test-key','LGBTQI-AIM(AIM)');
+  assert.equal(result.teamId,team.team_id);
+  assert.equal(result.members.length,1);
+  assert.ok(calls[0].includes('nickname=LGBTQI-AIM'));
+  assert.equal(await resolveFaceitTeam('test-key','LGBTQI-AIM(wrong)'), 'not_found');
+  assert.equal(await resolveFaceitTeam('test-key','fuzzy'), 'not_found');
+  assert.equal(teamSearchParts(`https://www.faceit.com/en/teams/${team.team_id}/stats`).id,team.team_id);
+  assert.equal(parseTeamProfile({...team,game:'cs2'}),null);
+});
+
+test('team map-history entries deduplicate to series and malformed history never means complete', () => {
+  const { parseTeamHistory } = load(resolve(src,'faceit-team-collect.ts'));
+  assert.deepEqual(Array.from(parseTeamHistory([{matchId:'series1'},{matchId:'series1'},{matchId:'series2'}])), ['series1','series2']);
+  assert.equal(parseTeamHistory({error:'blocked'}),null);
+  assert.equal(parseTeamHistory([{unexpected:'shape'}]),null);
+  assert.equal(parseTeamHistory([]).length,0);
+});
+
+test('roster history cannot overwrite a collected team series with its first-map result', async () => {
+  const sqlite = new DatabaseSync(':memory:');
+  for (const file of readdirSync(resolve(src, '../drizzle-faceit')).filter(f => f.endsWith('.sql')).sort()) sqlite.exec(readFileSync(resolve(src, '../drizzle-faceit', file), 'utf8'));
+  const client = { prepare(sql) { return { bind(...params) { return { async all() { return { results:sqlite.prepare(sql).all(...params),meta:{} }; } }; } }; }, async batch(statements) { return Promise.all(statements.map(s=>s.all())); } };
+  try {
+    const db = drizzle(client);
+    const { matchSummaryStmt, matchPlayerListStmt } = load(resolve(src,'faceit-collect.ts'));
+    sqlite.exec(`INSERT INTO faceit_matches (match_id,status,winner_faction,factions_json,detail_synced_at,created_at,updated_at) VALUES ('series','finished','faction1','{"faction1":{"score":3},"faction2":{"score":2}}',1,0,0);
+      INSERT INTO faceit_match_players (id,match_id,player_id,faction,team_id,result,created_at,updated_at) VALUES ('series:p1','series','p1','faction1','team1','win',0,0)`);
+    await db.batch([matchSummaryStmt(db, { matchId:'series',status:'finished',winnerFaction:'faction2',factionsJson:'{"faction1":{"score":1}}' },new Date()),
+      matchPlayerListStmt(db,'series',{ playerId:'p1',faction:'faction1',teamId:'team1',nickname:'p1',result:'loss' },new Date())]);
+    assert.equal(sqlite.prepare('SELECT winner_faction FROM faceit_matches').get().winner_faction,'faction1');
+    assert.equal(JSON.parse(sqlite.prepare('SELECT factions_json FROM faceit_matches').get().factions_json).faction1.score,3);
+    assert.equal(sqlite.prepare('SELECT result FROM faceit_match_players').get().result,'win');
+  } finally { sqlite.close(); }
+});
+
+test('team collection pages its own feed and collects roster histories separately with shared details', async () => {
+  const sqlite = new DatabaseSync(':memory:');
+  for (const file of readdirSync(resolve(src, '../drizzle-faceit')).filter(f => f.endsWith('.sql')).sort()) sqlite.exec(readFileSync(resolve(src, '../drizzle-faceit', file), 'utf8'));
+  const client = { prepare(sql) { return { bind(...params) { return {
+    async raw() { const stmt=sqlite.prepare(sql);stmt.setReturnArrays(true);return stmt.all(...params); },
+    async all() { return { results:sqlite.prepare(sql).all(...params),meta:{} }; },
+    async run() { return {meta:sqlite.prepare(sql).run(...params)}; },
+  }; } }; }, async batch(statements) { return Promise.all(statements.map(s=>s.all())); } };
+  const calls=[];
+  let unavailable=false;
+  const { registerTeam, advanceTeam } = load(resolve(src,'faceit-team-collect.ts'), { URLSearchParams,AbortSignal,
+    fetch: async url => {
+      calls.push(url);
+      let status=200,body;
+      if(url.includes('/time/teams/')) { status=unavailable?403:200; body=unavailable?{error:'blocked'}:[{matchId:'team-match'},{matchId:'team-match'}]; }
+      else if(url.includes('/players/p1/history')) body={items:[{match_id:'solo-match',game_id:'ow2',game_mode:'5v5',status:'FINISHED',teams:{faction1:{team_id:'other-team',players:[{player_id:'p1',nickname:'Player'}]}}}]};
+      else if(url.endsWith('/players/p1')) body={player_id:'p1',nickname:'Player',games:{ow2:{game_player_name:'Player#1234'}}};
+      else if(url.endsWith('/matches/team-match')) body={match_id:'team-match',game:'ow2',game_mode:'5v5',status:'FINISHED',teams:{faction1:{faction_id:'team',name:'Team',roster:[{player_id:'p1',nickname:'Player'}]}}};
+      else { status=404;body=null; }
+      return {status,json:async()=>body};
+    },
+  });
+  const db=drizzle(client);
+  try {
+    await registerTeam(db,{teamId:'team',name:'Team',nickname:'T',avatarUrl:null,members:[{playerId:'p1',nickname:'Player'}]},'deep');
+    await advanceTeam(db,'test-key','team','deep');
+    assert.deepEqual(sqlite.prepare('SELECT match_id FROM faceit_scout_team_matches').all().map(r=>r.match_id),['team-match']);
+    assert.deepEqual(sqlite.prepare("SELECT match_id FROM faceit_match_players WHERE player_id='p1' ORDER BY match_id").all().map(r=>r.match_id),['solo-match','team-match']);
+    assert.equal(sqlite.prepare('SELECT list_done FROM faceit_scout_teams').get().list_done,1);
+    assert.equal(sqlite.prepare('SELECT list_done,detail_done FROM faceit_players WHERE player_id=?').get('p1').detail_done,1);
+    assert.ok(calls.some(url=>url.includes('/time/teams/team/')));
+    assert.ok(calls.some(url=>url.includes('/players/p1/history')));
+    // Provider failure must leave the team cursor unchanged, never mark it complete.
+    await registerTeam(db,{teamId:'team',name:'Team',nickname:'T',avatarUrl:null,members:[]},'deep');
+    unavailable=true;
+    assert.equal(await advanceTeam(db,'test-key','team','deep'),'error');
+    const state=sqlite.prepare('SELECT list_done,list_page FROM faceit_scout_teams').get();
+    assert.equal(state.list_done,0);assert.equal(state.list_page,0);
+  } finally {sqlite.close();}
+});

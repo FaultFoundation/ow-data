@@ -1,3 +1,4 @@
+import { resolveFaceitTeam, registerTeam, advanceTeam } from "./faceit-team-collect";
 import { drizzle } from "drizzle-orm/d1";
 import { and, desc, isNotNull, isNull, lt, or } from "drizzle-orm";
 import { eq } from "drizzle-orm";
@@ -611,6 +612,25 @@ export default {
 
     // FACEIT match search — gated by the same bearer as /run (the Commons calls
     // it server-to-server). POST triggers a collection; GET reads the cache.
+    if (["/faceit/team/search", "/faceit/team/advance"].includes(url.pathname) && request.method === "POST") {
+      if (!env.OW_POLLER_SECRET || !env.FACEIT_API_KEY) return json({ error: "not configured" }, 503);
+      if (!bearerOk(request.headers.get("authorization"), env.OW_POLLER_SECRET)) return json({ error: "unauthorized" }, 401);
+      const mode = url.searchParams.get("mode") === "deep" ? "deep" : "quick";
+      const db = faceitDb(env);
+      let teamId = url.searchParams.get("team_id") || "";
+      if (url.pathname.endsWith("/search")) {
+        const raw = url.searchParams.get("nickname") || teamId;
+        if (!raw || raw.length > 256) return json({ error: "team required" }, 400);
+        const team = await resolveFaceitTeam(env.FACEIT_API_KEY, raw);
+        if (team === "not_found") return json({ error: "team not found or ambiguous; use its FACEIT URL" }, 404);
+        if (!team) return json({ error: "FACEIT unreachable" }, 502);
+        await registerTeam(db, team, mode);
+        return json({ teamId: team.teamId });
+      }
+      if (!teamId) return json({ error: "team_id required" }, 400);
+      const status = await advanceTeam(db, env.FACEIT_API_KEY, teamId, mode);
+      return json({ teamId, status }, status === "error" ? 502 : status === "not_found" ? 404 : 200);
+    }
     if (url.pathname === "/faceit/search" && request.method === "POST") {
       if (!env.OW_POLLER_SECRET) return json({ error: "not configured" }, 503);
       if (!bearerOk(request.headers.get("authorization"), env.OW_POLLER_SECRET)) {

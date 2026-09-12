@@ -22,6 +22,13 @@
       "when": 1788961323894,
       "tag": "0002_third_jack_murdock",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1789234650843,
+      "tag": "0003_melted_vin_gonzales",
+      "breakpoints": true
     }
   ]
 }
