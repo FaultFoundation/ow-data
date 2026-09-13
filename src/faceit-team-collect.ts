@@ -1,7 +1,7 @@
 import { and, eq, isNull, or, sql } from "drizzle-orm";
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 import { faceitPlayers, faceitMatches, faceitScoutTeams, faceitScoutTeamMatches } from "./faceit-schema";
-import { fetchJson, resolveFaceitPlayer, upsertProfileStmt, collectListChunk, collectDetailChunk, finalizePlayerState, parseHistoryItem, matchSummaryStmt, matchPlayerListStmt } from "./faceit-collect";
+import { fetchJson, resolveFaceitPlayer, upsertProfileStmt, collectListChunk, collectDetailChunk, finalizePlayerState, parseHistoryItem, matchSummaryStmt, matchPlayerListStmt, chunkForPlayer } from "./faceit-collect";
 
 // Team membership is never inferred from the roster's individual match lists.
 // This is the feed used by FACEIT's team Stats page (getMatchHistoryTeamStats).
@@ -34,21 +34,9 @@ export async function resolveFaceitTeam(apiKey: string, raw: string): Promise<Te
     return res?.status === 200 ? parseTeamProfile(res.body) : null;
   };
   if (query.id) return detail(query.id);
-  const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
-  const candidates: TeamProfile[] = [];
-  for (let offset = 0; offset < 1000; offset += 100) {
-    const res = await fetchJson(`${DATA}/search/teams?${new URLSearchParams({ nickname: query.name, game: "ow2", offset: String(offset), limit: "100" })}`, apiKey);
-    const items = (res?.body as { items?: { team_id: string; name: string }[] })?.items;
-    if (res?.status !== 200 || !Array.isArray(items)) return null;
-    for (const item of items.filter(t => same(t.name, query.name))) {
-      const team = await detail(item.team_id);
-      if (!team) return null;
-      if (team !== "not_found" && (!query.tag || same(team.nickname, query.tag))) candidates.push(team);
-    }
-    if (items.length < 100) break;
-  }
-  // Never silently scout the first fuzzy/ambiguous search result.
-  return candidates.length === 1 ? candidates[0] : "not_found";
+  // Commons resolves names against its cached directory and sends the selected
+  // ID. Never use FACEIT's fuzzy search to choose an identity.
+  return "not_found";
 }
 
 export function parseTeamHistory(body: unknown): string[] | null {
@@ -120,12 +108,32 @@ export async function advanceTeam(db: Db, apiKey: string, teamId: string, mode: 
   }
   // One unfinished roster member per request keeps the same bounded collection
   // engine and avoids multiplying the request deadline by the roster size.
+  //
+  // A single roster member's failure must NEVER abort the whole team advance: a
+  // renamed or deleted member account (or one member's transient provider error)
+  // used to `return "error"` here, which the Commons surfaced as an error that
+  // its deep-search loop retried forever — the load bar frozen on its last count
+  // while the team's own feed was already fully collected. A member failure is
+  // now recorded on that member and the advance keeps going.
   for (const member of members) {
     if (Date.now() >= stopAt) break;
     let [row] = await db.select().from(faceitPlayers).where(eq(faceitPlayers.playerId, member.playerId));
     if (!row?.searchMode || row.searchMode !== mode) {
       const profile = await resolveFaceitPlayer(apiKey, { playerId: member.playerId });
-      if (!profile || profile === "not_found") return "error";
+      if (profile === "not_found") {
+        // The account no longer resolves — mark it terminal so it is skipped and
+        // never wedges the team's readiness, then move on to the next member.
+        await db.batch([db.insert(faceitPlayers)
+          .values({ playerId: member.playerId, nickname: member.nickname, game: "ow2", searchMode: mode,
+            pollChunk: chunkForPlayer(member.playerId), status: "not_found", listDone: true, detailDone: true,
+            matchCount: 0, lastSyncedAt: new Date(), updatedAt: new Date() })
+          .onConflictDoUpdate({ target: faceitPlayers.playerId,
+            set: { searchMode: mode, status: "not_found", listDone: true, detailDone: true, lastSyncedAt: new Date(), updatedAt: new Date() } })]);
+        continue;
+      }
+      // A transient resolve failure: leave the member untouched (it retries on a
+      // later tick or the cron) and try another member rather than aborting.
+      if (!profile) continue;
       await db.batch([upsertProfileStmt(db, profile, { mode, now: new Date() })]);
       [row] = await db.select().from(faceitPlayers).where(eq(faceitPlayers.playerId, member.playerId));
     }
@@ -139,7 +147,9 @@ export async function advanceTeam(db: Db, apiKey: string, teamId: string, mode: 
       : { newOffset: row.listOffset, listDone: row.listDone, failed: false };
     const detail = await collectDetailChunk(db, apiKey, member.playerId, 12, stopAt);
     await finalizePlayerState(db, member.playerId, { listOffset: list.newOffset, listDone: list.listDone, failed: list.failed || detail.failed > 0 });
-    if (list.failed || detail.failed) return "error";
+    // finalizePlayerState already recorded status="error" on this member; try the
+    // next one instead of failing the whole team advance.
+    if (list.failed || detail.failed) continue;
     break;
   }
   return "collecting";

@@ -243,19 +243,20 @@ test('finished matches without a veto complete, while unavailable or malformed v
   } finally { sqlite.close(); }
 });
 
-test('team lookup resolves exact name(tag), deduplicates roster, and rejects fuzzy names', async () => {
+test('team lookup uses explicit IDs and never calls FACEIT fuzzy search', async () => {
   const calls = [];
   const team = { team_id: 'df36dcb1-6397-4f2d-8fca-562bad8f307f', game:'ow2', name:'LGBTQI-AIM', nickname:'AIM', members:[{ user_id:'p1', nickname:'AliveFPS' }, { user_id:'p1', nickname:'AliveFPS' }] };
   const { resolveFaceitTeam, teamSearchParts, parseTeamProfile } = load(resolve(src,'faceit-team-collect.ts'), {
     URLSearchParams, AbortSignal,
-    fetch: async url => { calls.push(url); return { status:200, json: async () => url.includes('/search/teams') ? { items:[{ team_id:team.team_id, name:team.name }, { team_id:'unrelated', name:'Rizz Aim' }] } : team }; },
+    fetch: async url => { calls.push(url); assert.ok(!url.includes('/search/')); return { status:200, json: async () => team }; },
   });
-  const result = await resolveFaceitTeam('test-key','LGBTQI-AIM(AIM)');
+  const result = await resolveFaceitTeam('test-key',team.team_id);
   assert.equal(result.teamId,team.team_id);
   assert.equal(result.members.length,1);
-  assert.ok(calls[0].includes('nickname=LGBTQI-AIM'));
-  assert.equal(await resolveFaceitTeam('test-key','LGBTQI-AIM(wrong)'), 'not_found');
-  assert.equal(await resolveFaceitTeam('test-key','fuzzy'), 'not_found');
+  assert.equal(calls.length,1);
+  assert.ok(calls[0].endsWith(`/teams/${team.team_id}`));
+  assert.equal(await resolveFaceitTeam('test-key','LGBTQI-AIM(AIM)'), 'not_found');
+  assert.equal(calls.length,1, 'names must be resolved locally before the Worker is called');
   assert.equal(teamSearchParts(`https://www.faceit.com/en/teams/${team.team_id}/stats`).id,team.team_id);
   assert.equal(parseTeamProfile({...team,game:'cs2'}),null);
 });
@@ -323,5 +324,41 @@ test('team collection pages its own feed and collects roster histories separatel
     assert.equal(await advanceTeam(db,'test-key','team','deep'),'error');
     const state=sqlite.prepare('SELECT list_done,list_page FROM faceit_scout_teams').get();
     assert.equal(state.list_done,0);assert.equal(state.list_page,0);
+  } finally {sqlite.close();}
+});
+
+test('an unresolvable roster member is marked terminal and never aborts the team advance', async () => {
+  const sqlite = new DatabaseSync(':memory:');
+  for (const file of readdirSync(resolve(src, '../drizzle-faceit')).filter(f => f.endsWith('.sql')).sort()) sqlite.exec(readFileSync(resolve(src, '../drizzle-faceit', file), 'utf8'));
+  const client = { prepare(sql) { return { bind(...params) { return {
+    async raw() { const stmt=sqlite.prepare(sql);stmt.setReturnArrays(true);return stmt.all(...params); },
+    async all() { return { results:sqlite.prepare(sql).all(...params),meta:{} }; },
+    async run() { return {meta:sqlite.prepare(sql).run(...params)}; },
+  }; } }; }, async batch(statements) { return Promise.all(statements.map(s=>s.all())); } };
+  const { registerTeam, advanceTeam } = load(resolve(src,'faceit-team-collect.ts'), { URLSearchParams,AbortSignal,
+    fetch: async url => {
+      let status=200,body;
+      if(url.includes('/time/teams/')) body=[{matchId:'team-match'}];
+      else if(url.includes('/players/gone/history')) { status=404;body=null; }
+      else if(url.endsWith('/players/gone')) { status=404;body=null; } // a renamed/deleted account
+      else if(url.includes('/players/p1/history')) body={items:[{match_id:'solo-match',game_id:'ow2',game_mode:'5v5',status:'FINISHED',teams:{faction1:{team_id:'other-team',players:[{player_id:'p1',nickname:'Player'}]}}}]};
+      else if(url.endsWith('/players/p1')) body={player_id:'p1',nickname:'Player',games:{ow2:{game_player_name:'Player#1234'}}};
+      else if(url.endsWith('/matches/team-match')) body={match_id:'team-match',game:'ow2',game_mode:'5v5',status:'FINISHED',teams:{faction1:{faction_id:'team',name:'Team',roster:[{player_id:'p1',nickname:'Player'}]}}};
+      else { status=404;body=null; }
+      return {status,json:async()=>body};
+    },
+  });
+  const db=drizzle(client);
+  try {
+    // The dead member is first in the roster, so a naive `return "error"` would
+    // abort before the live member or the team feed were ever collected.
+    await registerTeam(db,{teamId:'team',name:'Team',nickname:'T',avatarUrl:null,members:[{playerId:'gone',nickname:'Gone'},{playerId:'p1',nickname:'Player'}]},'deep');
+    const result = await advanceTeam(db,'test-key','team','deep');
+    assert.notEqual(result,'error','one bad member must not fail the whole team advance');
+    const gone=sqlite.prepare("SELECT status,list_done,detail_done FROM faceit_players WHERE player_id='gone'").get();
+    assert.equal(gone.status,'not_found');
+    assert.equal(gone.list_done,1);assert.equal(gone.detail_done,1);
+    assert.deepEqual(sqlite.prepare('SELECT match_id FROM faceit_scout_team_matches').all().map(r=>r.match_id),['team-match'],'the team feed is still collected');
+    assert.ok(sqlite.prepare("SELECT 1 FROM faceit_players WHERE player_id='p1'").get(),'the live member is still reached');
   } finally {sqlite.close();}
 });
