@@ -321,7 +321,9 @@ test('team collection pages its own feed and collects roster histories separatel
     // Provider failure must leave the team cursor unchanged, never mark it complete.
     await registerTeam(db,{teamId:'team',name:'Team',nickname:'T',avatarUrl:null,members:[]},'deep');
     unavailable=true;
-    assert.equal(await advanceTeam(db,'test-key','team','deep'),'error');
+    const issues=[];
+    assert.equal(await advanceTeam(db,'test-key','team','deep',message=>issues.push(message)),'error');
+    assert.match(issues[0],/page 1.*403/);
     const state=sqlite.prepare('SELECT list_done,list_page FROM faceit_scout_teams').get();
     assert.equal(state.list_done,0);assert.equal(state.list_page,0);
   } finally {sqlite.close();}
@@ -360,5 +362,31 @@ test('an unresolvable roster member is marked terminal and never aborts the team
     assert.equal(gone.list_done,1);assert.equal(gone.detail_done,1);
     assert.deepEqual(sqlite.prepare('SELECT match_id FROM faceit_scout_team_matches').all().map(r=>r.match_id),['team-match'],'the team feed is still collected');
     assert.ok(sqlite.prepare("SELECT 1 FROM faceit_players WHERE player_id='p1'").get(),'the live member is still reached');
+  } finally {sqlite.close();}
+});
+
+test('team advance repairs missing shared details even when a member is already flagged done', async () => {
+  const sqlite = new DatabaseSync(':memory:');
+  for (const file of readdirSync(resolve(src, '../drizzle-faceit')).filter(f => f.endsWith('.sql')).sort()) sqlite.exec(readFileSync(resolve(src, '../drizzle-faceit', file), 'utf8'));
+  const client = { prepare(sql) { return { bind(...params) { return {
+    async raw() { const stmt=sqlite.prepare(sql);stmt.setReturnArrays(true);return stmt.all(...params); },
+    async all() { return { results:sqlite.prepare(sql).all(...params),meta:{} }; },
+    async run() { return {meta:sqlite.prepare(sql).run(...params)}; },
+  }; } }; }, async batch(statements) { return Promise.all(statements.map(s=>s.all())); } };
+  try {
+    sqlite.exec(`INSERT INTO faceit_scout_teams (team_id,name,nickname,roster_json,search_mode,list_page,list_done,updated_at) VALUES ('team','Team','T','[{"playerId":"p1","nickname":"Player"}]','deep',1,1,0);
+      INSERT INTO faceit_players (player_id,nickname,game,search_mode,list_done,detail_done,status,created_at,updated_at) VALUES ('p1','Player','ow2','deep',1,1,'ready',0,0);
+      INSERT INTO faceit_matches (match_id,detail_synced_at,stats_synced_at,rounds_synced_at,created_at,updated_at) VALUES ('shared',1,1,1,0,0);
+      INSERT INTO faceit_match_players (id,match_id,player_id,created_at,updated_at) VALUES ('shared:p1','shared','p1',0,0);`);
+    const calls=[];
+    const {advanceTeam}=load(resolve(src,'faceit-team-collect.ts'),{AbortSignal,fetch:async url=>{
+      calls.push(url);
+      return {status:404,json:async()=>null};
+    }});
+    await advanceTeam(drizzle(client),'test-key','team','deep');
+    assert.ok(sqlite.prepare("SELECT voting_synced_at FROM faceit_matches WHERE match_id='shared'").get().voting_synced_at, 'the pending shared match must actually be collected');
+    assert.equal(calls.length,2);
+    await advanceTeam(drizzle(client),'test-key','team','deep');
+    assert.equal(calls.length,2,'completed roster does not refetch');
   } finally {sqlite.close();}
 });

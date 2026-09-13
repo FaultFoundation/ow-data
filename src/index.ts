@@ -628,8 +628,9 @@ export default {
         return json({ teamId: team.teamId });
       }
       if (!teamId) return json({ error: "team_id required" }, 400);
-      const status = await advanceTeam(db, env.FACEIT_API_KEY, teamId, mode);
-      return json({ teamId, status }, status === "error" ? 502 : status === "not_found" ? 404 : 200);
+      let message: string | undefined;
+      const status = await advanceTeam(db, env.FACEIT_API_KEY, teamId, mode, issue => { message = issue; });
+      return json({ teamId, status, message }, status === "error" ? 502 : status === "not_found" ? 404 : 200);
     }
     if (url.pathname === "/faceit/search" && request.method === "POST") {
       if (!env.OW_POLLER_SECRET) return json({ error: "not configured" }, 503);

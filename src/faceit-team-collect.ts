@@ -1,7 +1,7 @@
 import { and, eq, isNull, or, sql } from "drizzle-orm";
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 import { faceitPlayers, faceitMatches, faceitScoutTeams, faceitScoutTeamMatches } from "./faceit-schema";
-import { fetchJson, resolveFaceitPlayer, upsertProfileStmt, collectListChunk, collectDetailChunk, finalizePlayerState, parseHistoryItem, matchSummaryStmt, matchPlayerListStmt, chunkForPlayer } from "./faceit-collect";
+import { fetchJson, resolveFaceitPlayer, upsertProfileStmt, collectListChunk, collectDetailChunk, finalizePlayerState, parseHistoryItem, matchSummaryStmt, matchPlayerListStmt, chunkForPlayer, countUndetailed } from "./faceit-collect";
 
 // Team membership is never inferred from the roster's individual match lists.
 // This is the feed used by FACEIT's team Stats page (getMatchHistoryTeamStats).
@@ -58,7 +58,8 @@ export async function registerTeam(db: Db, team: TeamProfile, mode: "quick" | "d
     set: { ...values, listPage: 0, listDone: false } });
 }
 
-export async function advanceTeam(db: Db, apiKey: string, teamId: string, mode: "quick" | "deep") {
+export async function advanceTeam(db: Db, apiKey: string, teamId: string, mode: "quick" | "deep", onError: (message: string) => void = () => {}) {
+  const fail = (message: string) => { onError(message); return "error" as const; };
   const [team] = await db.select().from(faceitScoutTeams).where(eq(faceitScoutTeams.teamId, teamId));
   if (!team) return "not_found";
   const stopAt = Date.now() + 18_000;
@@ -67,13 +68,13 @@ export async function advanceTeam(db: Db, apiKey: string, teamId: string, mode: 
   if (!team.listDone && (mode === "deep" || team.listPage === 0 || links.length < 50)) {
     const res = await fetchJson(`https://api.faceit.com/stats/v1/stats/time/teams/${encodeURIComponent(teamId)}/games/ow2?page=${team.listPage}&size=${PAGE_SIZE}`, "");
     const ids = res?.status === 200 ? parseTeamHistory(res.body) : null;
-    if (!ids) return "error";
+    if (!ids) return fail(`Team history page ${team.listPage + 1} failed (FACEIT ${res?.status ?? "timeout"}).`);
     for (const matchId of ids) {
       if (links.some(link => link.matchId === matchId)) continue;
       if (Date.now() >= stopAt) return "collecting";
       // Seed the normal match and participant rows from the match itself, not a player's history.
       const res = await fetchJson(`${DATA}/matches/${encodeURIComponent(matchId)}`, apiKey);
-      if (res?.status !== 200) return "error";
+      if (res?.status !== 200) return fail(`Team match ${matchId} failed (FACEIT ${res?.status ?? "timeout"}).`);
       // The Data API's match and history endpoints name faction fields differently.
       const body = res.body as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
       const teams = Object.fromEntries(Object.entries(body.teams ?? {}).map(([f, raw]) => {
@@ -81,7 +82,7 @@ export async function advanceTeam(db: Db, apiKey: string, teamId: string, mode: 
         return [f, { ...t, team_id: t.faction_id, nickname: t.name, players: t.roster }];
       }));
       const parsed = parseHistoryItem({ ...body, match_id: matchId, teams });
-      if (!parsed || !parsed.players.some(player => player.teamId === teamId)) return "error";
+      if (!parsed || !parsed.players.some(player => player.teamId === teamId)) return fail(`Team match ${matchId} did not contain the requested team roster.`);
       const now = new Date();
       await db.batch([matchSummaryStmt(db, parsed.match, now),
         ...parsed.players.map(p => matchPlayerListStmt(db, matchId, p, now)),
@@ -103,7 +104,7 @@ export async function advanceTeam(db: Db, apiKey: string, teamId: string, mode: 
     const ids = due.map(r => r.matchId).filter(id => mode === "deep" || matchIds.includes(id));
     if (ids.length) {
       const result = await collectDetailChunk(db, apiKey, "", 12, stopAt, ids);
-      if (result.failed) return "error";
+      if (result.failed) return fail(`Match details are unavailable for ${result.failed} team matches (overview, scoreboard, maps or voting).`);
     }
   }
   // One unfinished roster member per request keeps the same bounded collection
@@ -115,6 +116,7 @@ export async function advanceTeam(db: Db, apiKey: string, teamId: string, mode: 
   // its deep-search loop retried forever — the load bar frozen on its last count
   // while the team's own feed was already fully collected. A member failure is
   // now recorded on that member and the advance keeps going.
+  let memberFailure: string | undefined;
   for (const member of members) {
     if (Date.now() >= stopAt) break;
     let [row] = await db.select().from(faceitPlayers).where(eq(faceitPlayers.playerId, member.playerId));
@@ -133,11 +135,20 @@ export async function advanceTeam(db: Db, apiKey: string, teamId: string, mode: 
       }
       // A transient resolve failure: leave the member untouched (it retries on a
       // later tick or the cron) and try another member rather than aborting.
-      if (!profile) continue;
+      if (!profile) { memberFailure = `FACEIT could not resolve roster member ${member.nickname}.`; continue; }
       await db.batch([upsertProfileStmt(db, profile, { mode, now: new Date() })]);
       [row] = await db.select().from(faceitPlayers).where(eq(faceitPlayers.playerId, member.playerId));
     }
-    if (row.listDone && row.detailDone) continue;
+    // Other roster scans insert shared matches after these cached flags were
+    // written. The reader checks actual match markers, so the writer must too:
+    // otherwise it skips this player forever while the reader waits forever.
+    if (row.status === "not_found") continue;
+    if (row.listDone && await countUndetailed(db, member.playerId) === 0) {
+      if (!row.detailDone || row.status !== "ready") {
+        await finalizePlayerState(db, member.playerId, { listOffset: row.listOffset, listDone: true });
+      }
+      continue;
+    }
     if (mode === "quick") {
       const recent = await db.all<{ complete: number }>(sql`select count(*) as complete from (select m.stats_synced_at from faceit_matches m join faceit_match_players p on p.match_id=m.match_id where p.player_id=${member.playerId} order by m.started_at desc limit 48) where stats_synced_at is not null`);
       if (row.status !== "error" && Number(recent[0]?.complete) >= 48) continue;
@@ -149,8 +160,8 @@ export async function advanceTeam(db: Db, apiKey: string, teamId: string, mode: 
     await finalizePlayerState(db, member.playerId, { listOffset: list.newOffset, listDone: list.listDone, failed: list.failed || detail.failed > 0 });
     // finalizePlayerState already recorded status="error" on this member; try the
     // next one instead of failing the whole team advance.
-    if (list.failed || detail.failed) continue;
+    if (list.failed || detail.failed) { memberFailure = `FACEIT could not collect ${list.failed ? "history" : "match details"} for ${member.nickname}.`; continue; }
     break;
   }
-  return "collecting";
+  return memberFailure ? fail(memberFailure) : "collecting";
 }
